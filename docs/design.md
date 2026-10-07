@@ -1,8 +1,10 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); nothing is built.** Every number in
-section 8 that is not a measurement is marked *proposed*; the maintainer confirms or changes them before any code is written, because a gate
-is fixed before the code it judges. The measurements in section 2 were taken on cancho at `alpibrusl/cancho@0567e72` (after its UDP work,
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); nothing is built.** **Confirmed by the maintainer on
+2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
+and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
+document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
+A gate is fixed before the code it judges, so none of them moves to suit a result. The measurements in section 2 were taken on cancho at `alpibrusl/cancho@0567e72` (after its UDP work,
 `docs/udp.md`).
 
 ## 1. What this is for, and the claim it must survive
@@ -198,8 +200,8 @@ Any of these is written up here, in place, as the result.
 
 ## 11. Open questions for the maintainer
 
-1. Confirm section 3: ship v1 on an unnarrowed `Net` with the compiled-in table? (The cancho prerequisite of section 2 is filed: alpibrusl/cancho#362.)
-2. Confirm the proposed limits (section 5), the cache clamps and RRL values (section 6), and the benchmark criterion (section 8).
+1. ~~Confirm section 3~~ **Confirmed.** (The cancho prerequisite of section 2 is filed: alpibrusl/cancho#362.)
+2. ~~Confirm the proposed limits~~ **Confirmed** (sections 5, 6 and 8).
 3. Is Unbound the right gated comparator, or should the gate be against the best of all five per cell?
 4. What does `"bounded": true` mean in `cancho authority`'s JSON? It reads true for the empty bound.
 
