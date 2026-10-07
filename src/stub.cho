@@ -1,0 +1,197 @@
+edition 5;
+
+module stub;
+
+import dns;
+
+// `stub` -- D1's responder: what the server answers until there is a cache and a forwarder (D2, D3). It exists so that the
+// part of D1 that is the point -- the sockets, the framing, the EDNS size, truncation, the refusals -- can be tested
+// against real clients with answers of a size the test chooses. It is replaced, not extended: nothing here is policy for
+// the resolver.
+//
+// What it answers, for a query that `dns.parse` accepted:
+//
+//   * A: `n<digits>.<anything>` gets that many A records (at most 64), `192.0.2.1`, `192.0.2.2`, ...; any other name gets one.
+//   * TXT: `t<digits>.<anything>` gets one TXT record of that many bytes (at most 1500); any other name gets none.
+//   * every other type: no records (NOERROR, no data).
+//
+// What it refuses, with the RCODE `docs/design.md` section 5 gives: an opcode other than QUERY is NOTIMP; an EDNS version
+// other than 0 is BADVERS; a class other than IN, and the zone-transfer types AXFR and IXFR, are REFUSED.
+//
+// A reply over `limit` bytes (0 means no limit: TCP) is sent truncated instead: the header with TC set, the question and the
+// OPT record, and no answers, which is what tells a client to ask again over TCP.
+
+// The sizes a UDP reply is held to (`docs/design.md` section 5): what the client advertised, no less than this and no more.
+pub fn udp_floor() -> [] int {
+    return 512;
+}
+
+pub fn udp_ceiling() -> [] int {
+    return 1232;
+}
+
+// What the largest reply of this stub can be, so the buffer a caller gives it can be sized.
+pub fn largest() -> [] int {
+    return 2048;
+}
+
+// The most bytes a UDP reply to this parsed query may take.
+pub fn udp_limit[&t](table: &t [int]) -> [] int {
+    if table[9] < 0 {
+        return udp_floor();
+    }
+    var size = table[10];
+    if size < udp_floor() {
+        size = udp_floor();
+    }
+    if size > udp_ceiling() {
+        size = udp_ceiling();
+    }
+    return size;
+}
+
+// `n<digits>` or `t<digits>` at the start of the question name: answers the number, or -1 if the first label is not that.
+fn count_in[&q](query: &q [byte], marker: int, at: int) -> [] int {
+    let size = int_of(query[at]);
+    if size < 2 || size > 5 || int_of(query[at + 1]) != marker {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 2;
+    while i <= size {
+        let c = int_of(query[at + i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - '0');
+        i = i + 1;
+    }
+    return n;
+}
+
+// The header of a reply to a parsed query: its id, QR, the query's recursion-desired bit, RA, `rcode`; `answers` records.
+fn put_header[&o, &t](out: &!o [byte], table: &t [int], truncated: bool, answers: int, additional: int) -> [] int {
+    var flags = 32768 + table[1] / 256 % 2 * 256 + 128;
+    if truncated {
+        flags = flags + 512;
+    }
+    var p = dns.put16(out, 0, table[0]);
+    p = dns.put16(out, p, flags);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, answers);
+    p = dns.put16(out, p, 0);
+    return dns.put16(out, p, additional);
+}
+
+// Answer the (parsed) `query` into `out`, held to `limit` bytes if that is not 0. Answers the length, or `dns.error_no_room()`.
+pub fn respond[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [int], limit: int) -> [] int {
+    // Only QUERY is implemented.
+    if table[1] / 2048 % 16 != 0 {
+        return dns.encode_error(out, query, table, 4, udp_ceiling());
+    }
+    // Only EDNS version 0 is.
+    if table[9] >= 0 && table[12] != 0 {
+        return dns.encode_error(out, query, table, 16, udp_ceiling());
+    }
+    // Zone transfers, and any class but IN, are refused.
+    if table[8] != 1 || table[7] == 251 || table[7] == 252 {
+        return dns.encode_error(out, query, table, 5, udp_ceiling());
+    }
+    let question_end = dns.name_end(query, dns.header_size()) + 4;
+    var records = 0;
+    var data = 0;
+    var strings = 0;
+    if table[7] == 1 {
+        records = count_in(query, 'n', dns.header_size());
+        if records < 0 {
+            records = 1;
+        }
+        if records > 64 {
+            records = 64;
+        }
+    } else if table[7] == 16 {
+        let size = count_in(query, 't', dns.header_size());
+        if size >= 0 {
+            records = 1;
+            data = size;
+            if data > 1500 {
+                data = 1500;
+            }
+            strings = (data + 254) / 255;
+        }
+    }
+    var additional = 0;
+    var opt_bytes = 0;
+    if table[9] >= 0 {
+        additional = 1;
+        opt_bytes = dns.opt_size();
+    }
+    var answer_bytes = 0;
+    if table[7] == 1 {
+        answer_bytes = records * 16;
+    } else if records > 0 {
+        answer_bytes = 12 + data + strings;
+    }
+    let total = question_end + answer_bytes + opt_bytes;
+    var truncated = false;
+    if limit > 0 && total > limit {
+        truncated = true;
+    }
+    var size = total;
+    if truncated {
+        size = question_end + opt_bytes;
+    }
+    if size > len(out) {
+        return dns.error_no_room();
+    }
+    var shown = records;
+    if truncated {
+        shown = 0;
+    }
+    var p = put_header(out, table, truncated, shown, additional);
+    var i = dns.header_size();
+    while i < question_end {
+        out[i] = query[i];
+        i = i + 1;
+    }
+    p = question_end;
+    var k = 0;
+    while k < shown {
+        // The owner is a pointer to the question's name.
+        p = dns.put16(out, p, 49164);
+        if table[7] == 1 {
+            p = dns.put16(out, p, 1);
+            p = dns.put16(out, p, 1);
+            p = dns.put32(out, p, 60);
+            p = dns.put16(out, p, 4);
+            p = dns.put8(out, p, 192);
+            p = dns.put8(out, p, 0);
+            p = dns.put8(out, p, 2);
+            p = dns.put8(out, p, k + 1);
+        } else {
+            p = dns.put16(out, p, 16);
+            p = dns.put16(out, p, 1);
+            p = dns.put32(out, p, 60);
+            p = dns.put16(out, p, data + strings);
+            var left = data;
+            while left > 0 {
+                var chunk = left;
+                if chunk > 255 {
+                    chunk = 255;
+                }
+                p = dns.put8(out, p, chunk);
+                var j = 0;
+                while j < chunk {
+                    p = dns.put8(out, p, 'x');
+                    j = j + 1;
+                }
+                left = left - chunk;
+            }
+        }
+        k = k + 1;
+    }
+    if additional == 1 {
+        p = dns.put_opt(out, p, udp_ceiling(), 0);
+    }
+    return p;
+}

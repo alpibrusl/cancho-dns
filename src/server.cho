@@ -1,0 +1,525 @@
+edition 5;
+
+import std.buffer;
+import std.conns;
+import std.io;
+import dns;
+import stub;
+
+// `server` -- D1 of `docs/design.md`: UDP and TCP on one poller, answering from the stub (`src/stub.cho`) until there is a
+// cache and a forwarder.
+//
+//     server <port> [<idle seconds>]            (10 seconds)
+//
+// One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection.
+//
+// **UDP.** Datagrams are read until the socket has none (at most 64 a turn, so a flood cannot starve the connections), each
+// answered at once with `udp_send_to` through the ticket `udp_recv_from` issued. A datagram that is a response is dropped; one that
+// cannot be parsed is answered FORMERR with its id if it has one; a reply over the client's size (512, or what it advertised in
+// EDNS, no more than 1232) is truncated with TC set.
+//
+// **TCP.** Each message has a two-byte length in front (RFC 1035 section 4.2.2). A connection's bytes are buffered until a whole
+// message is there; several messages in one read are answered in order; a message shorter than a header or longer than the buffer
+// closes the connection, and so does one that has said nothing for the idle time. Replies are not truncated. What the kernel will
+// not take is queued per connection and the connection is watched for room to write instead of for input.
+//
+// Sizes are fixed at start and nothing is allocated afterwards: at most 128 connections, each with a 4,098-byte input buffer and a
+// 16 KiB output queue.
+
+fn max_connections() -> [] int {
+    return 128;
+}
+
+// The largest query over TCP: its length prefix says up to 65,535 and this is what is read (`docs/design.md` section 5).
+fn frame_max() -> [] int {
+    return 4096;
+}
+
+fn input_size() -> [] int {
+    return frame_max() + 2;
+}
+
+fn output_size() -> [] int {
+    return 16384;
+}
+
+// The most datagrams read in one turn.
+fn udp_burst() -> [] int {
+    return 64;
+}
+
+// Per connection `k`, `state[8k..8k+8]` is:
+//
+//     0  bytes of input buffered
+//     1  1 if the slot is in use
+//     2  bytes of output waiting (-1: the queue could not hold it)
+//     3  1 if the connection closes once that output has gone
+//     4  what it is watched for (1 to read, 2 to write)
+//     5  when it last did anything, in milliseconds
+fn stride() -> [] int {
+    return 8;
+}
+
+res struct Core {
+    poller: Poller,
+    // `poller_wait` fills these with (token, readiness) pairs.
+    events: Box[[int]],
+    state: Box[[int]],
+    bufs: Box[[byte]],
+    pends: Box[[byte]],
+    // The parse table of the message in hand.
+    table: Box[[int]],
+    // The reply being built, with two bytes in front of it for the TCP length.
+    scratch: Box[[byte]],
+    // One datagram.
+    datagram: Box[[byte]],
+    // The ticket of the datagram's sender.
+    who: Box[[int]],
+}
+
+// ---------------------------------------------------------------------
+// One message in, one reply out
+// ---------------------------------------------------------------------
+
+// Answer the message `data` into `out`: its length, or 0 for none (a response, or nothing to say). `udp` holds the reply to the size
+// the client can take; TCP does not.
+fn handle[&d, &t, &o](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool) -> [] int {
+    if dns.is_response(data) {
+        return 0;
+    }
+    if dns.parse(data, table) < 0 {
+        return dns.encode_formerr(out, data);
+    }
+    var limit = 0;
+    if udp {
+        limit = stub.udp_limit(table);
+    }
+    let n = stub.respond(out, data, table, limit);
+    if n < 0 {
+        // The reply did not fit the buffer: SERVFAIL is small.
+        return dns.encode_error(out, data, table, 2, stub.udp_ceiling());
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------
+
+// Read and answer the datagrams waiting, up to the burst.
+fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core) -> [udp_recv, udp_send] int {
+    let tb = contents(core.table);
+    let sc = contents(core.scratch);
+    let dg = contents(core.datagram);
+    let who = contents(core.who);
+    var more = true;
+    var turns = 0;
+    while more && turns < udp_burst() {
+        turns = turns + 1;
+        match udp_recv_from(sock, dg, who) {
+            Datagram::Got(n) => {
+                let sent = handle(dg[0..n], tb, sc, true);
+                if sent > 0 {
+                    udp_send_to(sock, sc[0..sent], who[0]);
+                }
+            }
+            Datagram::Truncated(n) => {
+                // Bigger than any query this reads: dropped.
+            }
+            Datagram::Again => {
+                more = false;
+            }
+            Datagram::Failed(e) => {
+                more = false;
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// TCP: one connection's bytes
+// ---------------------------------------------------------------------
+
+// Hand `data` to the kernel without waiting for room, and keep what it did not take. Answers the new `pending`, or -1 if the
+// queue cannot hold the rest or the connection has failed: the caller closes it.
+fn emit[&c, &d, &e](table: &!c conns.Table, slot: int, data: &d [byte], pend: &!e [byte], pending: int) -> [conn_write] int {
+    var at = 0;
+    if pending == 0 {
+        match conns.write(table, slot, data) {
+            Sent::Wrote(n) => {
+                at = n;
+            }
+            Sent::Again => {
+            }
+            Sent::Failed(e) => {
+                return 0 - 1;
+            }
+        }
+    }
+    if at >= len(data) {
+        return pending;
+    }
+    if pending + len(data) - at > len(pend) {
+        return 0 - 1;
+    }
+    var i = at;
+    while i < len(data) {
+        pend[pending + i - at] = data[i];
+        i = i + 1;
+    }
+    return pending + len(data) - at;
+}
+
+fn shut[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [] int {
+    let st = contents(core.state);
+    conns.close(tab, k);
+    st[stride() * k + 1] = 0;
+    return 0;
+}
+
+// Watch `k` for what it now waits on: room to write if output is queued (and read no more), input otherwise.
+fn settle[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [poll] int {
+    let st = contents(core.state);
+    let p = stride() * k;
+    var want = 1;
+    if st[p + 2] > 0 {
+        want = 2;
+    }
+    if want != st[p + 4] {
+        conns.rewatch(tab, core.poller, k, k + 2, want);
+        st[p + 4] = want;
+    }
+    return 0;
+}
+
+// Answer every whole message buffered for connection `k`, queue or write the replies in order, and keep the start of one still
+// arriving. Closes the connection if it is to close or cannot be written to.
+fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let bf = contents(core.bufs);
+    let pd = contents(core.pends);
+    let sc = contents(core.scratch);
+    let tb = contents(core.table);
+    let p = stride() * k;
+    let base = k * input_size();
+    let obase = k * output_size();
+    var used = 0;
+    var going = true;
+    while going {
+        if st[p + 2] != 0 || st[p + 3] != 0 || st[p] - used < 2 {
+            going = false;
+        } else {
+            let size = int_of(bf[base + used]) * 256 + int_of(bf[base + used + 1]);
+            if size < dns.header_size() || size > frame_max() {
+                // Not a message, or one this does not read: the connection is closed after what has been said.
+                st[p + 3] = 1;
+                going = false;
+            } else if st[p] - used < 2 + size {
+                going = false;
+            } else {
+                let view = bf[base + used + 2..base + used + 2 + size];
+                let n = handle(view, tb, sc[2..len(sc)], false);
+                if n > 0 {
+                    dns.put16(sc, 0, n);
+                    st[p + 2] = emit(tab, k, sc[0..2 + n], pd[obase..obase + output_size()], st[p + 2]);
+                    if st[p + 2] < 0 {
+                        going = false;
+                    }
+                }
+                used = used + 2 + size;
+            }
+        }
+    }
+    if st[p + 2] < 0 {
+        shut(tab, core, k);
+        return 0;
+    }
+    var at_front = 0;
+    while at_front < st[p] - used {
+        bf[base + at_front] = bf[base + used + at_front];
+        at_front = at_front + 1;
+    }
+    st[p] = st[p] - used;
+    if st[p + 3] == 1 && st[p + 2] == 0 {
+        shut(tab, core, k);
+    } else {
+        settle(tab, core, k);
+    }
+    return 0;
+}
+
+// The poller said connection `k` is ready.
+fn step[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, readiness: int, now: int) -> [conn_read, conn_write, poll] int {
+    let st = contents(core.state);
+    let bf = contents(core.bufs);
+    let pd = contents(core.pends);
+    let p = stride() * k;
+    let base = k * input_size();
+    let obase = k * output_size();
+    if st[p + 2] > 0 {
+        // Waiting to send: the kernel can take more.
+        if readiness % 4 >= 2 {
+            match conns.write(tab, k, pd[obase..obase + st[p + 2]]) {
+                Sent::Wrote(sent) => {
+                    var at = 0;
+                    while at < st[p + 2] - sent {
+                        pd[obase + at] = pd[obase + sent + at];
+                        at = at + 1;
+                    }
+                    st[p + 2] = st[p + 2] - sent;
+                    st[p + 5] = now;
+                    if st[p + 2] == 0 {
+                        if st[p + 3] == 1 {
+                            shut(tab, core, k);
+                        } else {
+                            // Held back while the last replies were being sent.
+                            process(tab, core, k);
+                        }
+                    }
+                }
+                Sent::Again => {
+                }
+                Sent::Failed(e) => {
+                    shut(tab, core, k);
+                }
+            }
+        } else if readiness % 2 == 1 {
+            // The peer has gone, or said something while we are not listening.
+            shut(tab, core, k);
+        }
+    } else if st[p] >= input_size() {
+        // No room to read into and nothing to send: a message that can never fit was refused already.
+        shut(tab, core, k);
+    } else {
+        match conns.read(tab, k, bf[base + st[p]..base + input_size()]) {
+            Received::Data(got) => {
+                st[p] = st[p] + got;
+                st[p + 5] = now;
+                process(tab, core, k);
+            }
+            Received::End => {
+                shut(tab, core, k);
+            }
+            Received::Again => {
+            }
+            Received::Failed(e) => {
+                shut(tab, core, k);
+            }
+        }
+    }
+    return 0;
+}
+
+// Take every connection waiting on the listener, up to the limit: each goes in the table, is made non-blocking with Nagle off, and is
+// watched for input under the token `slot + 2`. Over the limit it is closed at once.
+fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Listener, core: &!c Core, now: int) -> [heap, conn_accept, poll] conns.Table {
+    let st = contents(core.state);
+    var table = conn;
+    var more = true;
+    while more {
+        match tcp_accept(listener) {
+            Accepted::Ok(c) => {
+                var held = 0;
+                borrow table as &tt in {
+                    held = conns.live(tt);
+                }
+                if held >= max_connections() {
+                    conn_close(c);
+                } else {
+                    let (grown, slot) = conns.put(heap, table, c);
+                    table = grown;
+                    if slot >= 0 {
+                        let p = stride() * slot;
+                        st[p] = 0;
+                        st[p + 1] = 1;
+                        st[p + 2] = 0;
+                        st[p + 3] = 0;
+                        st[p + 4] = 1;
+                        st[p + 5] = now;
+                        borrow mut table as &!ct in {
+                            if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 2, 1) != 0 {
+                                shut(ct, core, slot);
+                            }
+                        }
+                    }
+                }
+            }
+            Accepted::Again => {
+                more = false;
+            }
+            Accepted::Failed(e) => {
+                more = false;
+            }
+        }
+    }
+    return table;
+}
+
+// Close every connection that has done nothing for `idle` milliseconds.
+fn sweep[&t, &c](tab: &!t conns.Table, core: &!c Core, now: int, idle: int) -> [] int {
+    let st = contents(core.state);
+    var k = 0;
+    while k < max_connections() {
+        let p = stride() * k;
+        if st[p + 1] == 1 && now - st[p + 5] > idle {
+            shut(tab, core, k);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// The loop
+// ---------------------------------------------------------------------
+
+fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, clock: &k Clock, idle: int) -> [heap, conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
+    match poller_new() {
+        Polling::Ok(p) => {
+            var poller = p;
+            borrow mut poller as &!pw in {
+                poller_add_listener(pw, listener, 0);
+                poller_add_udp(pw, sock, 1, 1);
+            }
+            let limit = max_connections();
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0) };
+            var tab = conns.empty(heap, 64);
+            while true {
+                var ready = 0 - 1;
+                borrow mut core as &!cw in {
+                    ready = poller_wait(cw.poller, contents(cw.events), 1000);
+                }
+                let now = clock_ms(clock);
+                var j = 0;
+                while j < ready {
+                    var token = 0 - 1;
+                    var readiness = 0;
+                    borrow core as &cr in {
+                        token = contents(cr.events)[2 * j];
+                        readiness = contents(cr.events)[2 * j + 1];
+                    }
+                    if token == 0 {
+                        borrow mut core as &!cw in {
+                            tab = accept_all(heap, tab, listener, cw, now);
+                        }
+                    } else if token == 1 {
+                        borrow mut core as &!cw in {
+                            serve_udp(sock, cw);
+                        }
+                    } else {
+                        borrow mut tab as &!tw in {
+                            borrow mut core as &!cw in {
+                                if contents(cw.state)[stride() * (token - 2) + 1] == 1 {
+                                    step(tw, cw, token - 2, readiness, now);
+                                }
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+                borrow mut tab as &!tw in {
+                    borrow mut core as &!cw in {
+                        sweep(tw, cw, now, idle);
+                    }
+                }
+            }
+            conns.drop(heap, tab);
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who } = core;
+            poller_close(poller);
+            unbox_slice(heap, events);
+            unbox_slice(heap, state);
+            unbox_slice(heap, bufs);
+            unbox_slice(heap, pends);
+            unbox_slice(heap, table);
+            unbox_slice(heap, scratch);
+            unbox_slice(heap, datagram);
+            unbox_slice(heap, who);
+            return 0;
+        }
+        Polling::Failed(e) => {
+            return 4;
+        }
+    }
+}
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 9 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - '0');
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(fs);
+    release(ffi);
+    var port = 0 - 1;
+    var idle = 10;
+    borrow args as &g in {
+        if arg_count(g) > 1 {
+            port = number_of(arg(g, 1));
+        }
+        if arg_count(g) > 2 {
+            idle = number_of(arg(g, 2));
+        }
+    }
+    var status = 2;
+    if port > 0 && port < 65536 && idle > 0 && idle < 86400 {
+        status = 3;
+        borrow net as &nn in {
+            match tcp_listen(nn, port, 128, 0) {
+                Listening::Ok(l) => {
+                    var listener = l;
+                    match udp_bind(nn, port, 0) {
+                        UdpOpened::Ok(u) => {
+                            var sock = u;
+                            borrow mut listener as &!lh in {
+                                listener_nonblocking(lh);
+                                borrow mut sock as &!uh in {
+                                    udp_nonblocking(uh);
+                                    borrow mut heap as &!h in {
+                                        borrow mut io as &!i in {
+                                            var line = buffer.append(h, buffer.empty(h, 64), "listening on ");
+                                            line = buffer.push_nat(h, line, port);
+                                            line = buffer.push(h, line, byte_of(10));
+                                            borrow line as &lb in {
+                                                io.error_all(i, buffer.bytes(lb));
+                                            }
+                                            buffer.drop(h, line);
+                                        }
+                                        borrow clock as &c in {
+                                            status = run(h, lh, uh, c, idle * 1000);
+                                        }
+                                    }
+                                }
+                            }
+                            udp_close(sock);
+                        }
+                        UdpOpened::Failed(e) => {
+                        }
+                    }
+                    listener_close(listener);
+                }
+                Listening::Failed(e) => {
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

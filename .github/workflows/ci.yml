@@ -49,6 +49,14 @@ jobs:
         working-directory: dns
         run: mkdir -p build && ../cancho/target/release/cancho build --std tests/driver.cho src/dns.cho -o build/driver
 
+      - name: Stub responder tests
+        working-directory: dns
+        run: ../cancho/target/release/cancho test tests/stub_test.cho src/dns.cho src/stub.cho --std
+
+      - name: Build the server
+        working-directory: dns
+        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho -o build/server
+
       - name: dnspython, the oracle of the differential test
         run: pip install dnspython
 
@@ -69,3 +77,15 @@ jobs:
         run: |
           printf 'io_write\n' > /tmp/too-small.ceiling
           python3 tests/authority_check.py ../cancho/target/release/cancho /tmp/too-small.ceiling tests/driver.cho src/dns.cho --expect-failure
+
+      - name: Server black-box tests (UDP, TCP, truncation, framing, limits)
+        working-directory: dns
+        run: python3 tests/server_test.py build/server
+
+      - name: The server tests can fail (each deliberately wrong server is caught)
+        working-directory: dns
+        run: python3 tests/mutate_server.py ../cancho/target/release/cancho python3
+
+      - name: Server authority is within the ceiling (gate 6)
+        working-directory: dns
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho

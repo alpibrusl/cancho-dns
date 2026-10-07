@@ -1,0 +1,12 @@
+# Gate 6 for the D1 server: the codec, stub and server together.
+args
+clock
+conn_accept
+conn_read
+conn_write
+err_write
+heap
+net_in("")
+poll
+udp_recv
+udp_send

@@ -784,3 +784,43 @@ fn test_type_specific_data_is_checked_only_in_the_internet_class() -> [] int {
     }
     return 0;
 }
+
+// ---- Never answering a response, and the FORMERR for what cannot be read -------------------------------------------
+
+fn test_a_response_is_never_answered() -> [] int {
+    region a {
+        let data = alloc_slice[a](64, byte_of(0));
+        let out = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        test.assert(dns.is_response(data[0..size]));
+        test.assert_eq(dns.encode_formerr(out, data[0..size]), 0);
+        let q = query(data);
+        test.assert(!dns.is_response(data[0..q]));
+        // Fewer than four bytes: no flags to read.
+        test.assert(!dns.is_response(data[0..3]));
+        test.assert_eq(dns.encode_formerr(out, data[0..3]), 0);
+    }
+    return 0;
+}
+
+fn test_formerr_echoes_the_id_and_the_recursion_bit() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let out = alloc_slice[a](64, byte_of(0));
+        let size = query(data);
+        // Garbage after the header: the datagram is not a message, but its id and flags can be read.
+        test.assert_eq(dns.encode_formerr(out, data[0..20]), 12);
+        test.assert_eq(dns.parse(out[0..12], table), dns.error_bad_counts());
+        test.assert_eq(int_of(out[0]), 18);
+        test.assert_eq(int_of(out[1]), 52);
+        // QR, RD (the query's), RA and RCODE 1.
+        test.assert_eq(int_of(out[2]) * 256 + int_of(out[3]), 32768 + 256 + 128 + 1);
+        data[2] = byte_of(0);
+        test.assert_eq(dns.encode_formerr(out, data[0..size]), 12);
+        test.assert_eq(int_of(out[2]) * 256 + int_of(out[3]), 32768 + 128 + 1);
+        // A buffer under 12 bytes cannot hold it.
+        test.assert_eq(dns.encode_formerr(out[0..11], data[0..size]), 0);
+    }
+    return 0;
+}

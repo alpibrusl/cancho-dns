@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec, is built (section 12); nothing else is.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), and D1, the UDP and TCP server (section 13), are built; the cache, forwarder and benchmark are not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -99,7 +99,7 @@ framing), or a refusal. No allocation on a well-formed parse. Encoding writes in
 
 | input | limit | refusal tag | reply |
 |---|---|---|---|
-| datagram / TCP message | 512 bytes plain, 1232 with EDNS (the 2020 flag-day size); TCP 65,535 | `dns-message-too-long` | `FORMERR` / close |
+| datagram / TCP message | 512 bytes plain, 1232 with EDNS (the 2020 flag-day size); TCP 65,535 by the wire format, **4,096 read by the D1 server** (a smaller bound than planned: a query is a few hundred bytes, and a per-connection 4,098-byte input buffer keeps 128 connections at about 0.5 MB; a longer frame closes the connection) | `dns-message-too-long` | `FORMERR` / close |
 | header | 12 bytes, `QDCOUNT` exactly 1, `ANCOUNT`+`NSCOUNT`+`ARCOUNT` bounded below | `dns-bad-header`, `dns-bad-counts` | `FORMERR` |
 | name | 255 bytes on the wire, labels at most 63 | `dns-name-too-long`, `dns-label-too-long` | `FORMERR` |
 | compression | pointer strictly backwards, at most 16 hops | `dns-bad-pointer` | `FORMERR` |
@@ -255,7 +255,33 @@ report is unbounded, and CI runs it once with a ceiling that must be refused so 
 * The encoder (`encode_query`, `encode_error`) is tested by parsing what it writes with this codec, **not yet by dnspython**.
 * Record types whose data holds names beyond the ones the codec checks (NSEC, RRSIG's signer, KX, RP, and others) are opaque to it, as unknown types are.
 * The differential has been run on the debug compiler only; the pinned release build runs it in CI.
-* There is no server, no cache and no benchmark: the baseline table of section 8 is still empty.
+* There is no cache and no benchmark: the baseline table of section 8 is still empty (the server is section 13).
+
+## 13. D1, built and measured: the UDP and TCP server
+
+`src/server.cho` serves UDP and TCP on one port from one `Poller` (token 0 the listener, 1 the UDP socket, 2 and up the connections). `src/stub.cho` is the
+**responder of this step, not a resolver**: it answers from the name (`n<k>.` gives k A records, `t<k>.` one TXT of k bytes) so truncation, EDNS sizing and
+framing can be tested exactly; a forwarder replaces it in D3. Run: `server <port> [<idle seconds>]` (default 10).
+
+What it does, each item tested black-box by `tests/server_test.py` with dnspython as the client (12 tests, run against the built binary):
+
+* UDP: a reply over the client's advertised EDNS size, clamped to 512..1232 (512 with no EDNS), is replaced by a header-only TC reply; a malformed datagram
+  gets FORMERR (id and RD echoed); a response, or fewer than 4 bytes, gets nothing; NOTIMP, REFUSED (non-IN class, AXFR/IXFR) and BADVERS as in the stub.
+* TCP: 2-byte length framing; pipelined and byte-at-a-time messages are answered in order; a frame under 12 or over 4,096 bytes closes the connection; a
+  connection silent for the idle time is closed; at most 128 connections, and the port serves again once they are gone. Replies are not truncated.
+* UDP is drained in bursts of 64 per wakeup, so a flood on UDP cannot starve TCP (the starvation question of `udp.md`); this is by construction here, and
+  **not yet measured under load**.
+
+Gates: `authority/server.ceiling` (gate 6, diffed in CI) lists `args, clock, conn_accept, conn_read, conn_write, err_write, heap, net_in(""), poll, udp_recv,
+udp_send`, bounded, no ffi, no processes, no files. The `net_in("")` label is the unnarrowed `Net` of section 3, so it proves no more than that section claims.
+`tests/mutate_server.py` builds 5 mutants (short frame accepted, connection cap raised, idle timeout never fires, EDNS ceiling removed, UDP floor raised); all
+5 are killed. One mutant is **explained, not killed**: removing `size > frame_max()` changes nothing observable, because the input buffer (4,098 bytes)
+already closes a connection that cannot complete such a frame; the check is kept as the early, explicit refusal.
+
+Not done in D1, said so.
+* No load measurement and no comparison with another server: the baseline table of section 8 is still empty.
+* No upstream, cache or source-port randomisation (D2 to D4).
+* The server is tested on loopback only, and the differential test of the encoder against dnspython is still open from D0.
 
 ## Reproduce (section 2)
 
