@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  # The compiler these sources are built and tested with: part of the contract, since a source file does not record
+  # which `std` it was written against. This is the merge of alpibrusl/cancho#358 (the UDP sockets); it moves when
+  # cancho-dns needs something newer, in a change that says why.
+  CANCHO_REV: 0567e726181ca4ac9576a0b0fa9a806176954cfe
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dns
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: ${{ env.CANCHO_REV }}
+          path: cancho
+
+      - name: Cache the compiler
+        id: compiler
+        uses: actions/cache@v4
+        with:
+          path: cancho/target/release/cancho
+          key: cancho-${{ env.CANCHO_REV }}
+
+      - name: Build cancho
+        if: steps.compiler.outputs.cache-hit != 'true'
+        working-directory: cancho
+        run: cargo build --release -p cancho
+
+      - name: Formatting
+        working-directory: dns
+        run: ../cancho/target/release/cancho fmt --check src tests
+
+      - name: Codec tests (real messages, each refusal, every name of up to six bytes, every one- and two-byte change)
+        working-directory: dns
+        run: ../cancho/target/release/cancho test tests/dns_test.cho src/dns.cho --std
+
+      - name: Build the codec driver
+        working-directory: dns
+        run: mkdir -p build && ../cancho/target/release/cancho build --std tests/driver.cho src/dns.cho -o build/driver
+
+      - name: dnspython, the oracle of the differential test
+        run: pip install dnspython
+
+      - name: Differential test against dnspython (gate 1)
+        working-directory: dns
+        run: python3 tests/differential_codec.py build/driver
+
+      - name: The differential harness can fail (it catches each deliberately wrong codec)
+        working-directory: dns
+        run: python3 tests/mutate_harness.py ../cancho/target/release/cancho python3
+
+      - name: Authority is within the ceiling (gate 6)
+        working-directory: dns
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/codec.ceiling tests/driver.cho src/dns.cho
+
+      - name: The authority gate can fail (a ceiling that is too small must be refused)
+        working-directory: dns
+        run: |
+          printf 'io_write\n' > /tmp/too-small.ceiling
+          python3 tests/authority_check.py ../cancho/target/release/cancho /tmp/too-small.ceiling tests/driver.cho src/dns.cho --expect-failure
