@@ -473,24 +473,24 @@ pub fn error_rcode(code: int) -> [] int {
 
 // ---- Writing messages ------------------------------------------------------------------------------------------
 
-fn put8[&o](out: &!o [byte], at: int, v: int) -> [] int {
+pub fn put8[&o](out: &!o [byte], at: int, v: int) -> [] int {
     out[at] = byte_of(v);
     return at + 1;
 }
 
-fn put16[&o](out: &!o [byte], at: int, v: int) -> [] int {
+pub fn put16[&o](out: &!o [byte], at: int, v: int) -> [] int {
     out[at] = byte_of(v / 256);
     out[at + 1] = byte_of(v % 256);
     return at + 2;
 }
 
-fn put32[&o](out: &!o [byte], at: int, v: int) -> [] int {
+pub fn put32[&o](out: &!o [byte], at: int, v: int) -> [] int {
     let p = put16(out, at, v / 65536);
     return put16(out, p, v % 65536);
 }
 
 // An OPT record: the root as owner, the payload size we accept, the extended RCODE and no options.
-fn put_opt[&o](out: &!o [byte], at: int, udp_size: int, rcode: int) -> [] int {
+pub fn put_opt[&o](out: &!o [byte], at: int, udp_size: int, rcode: int) -> [] int {
     var p = put8(out, at, 0);
     p = put16(out, p, type_opt());
     p = put16(out, p, udp_size);
@@ -499,7 +499,7 @@ fn put_opt[&o](out: &!o [byte], at: int, udp_size: int, rcode: int) -> [] int {
 }
 
 // The size of an OPT record with no options.
-fn opt_size() -> [] int {
+pub fn opt_size() -> [] int {
     return 11;
 }
 
@@ -573,4 +573,25 @@ pub fn encode_error[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [in
         p = put_opt(out, p, udp_size, rcode);
     }
     return p;
+}
+
+// Is this a response (the QR bit is set)? A server never answers one: a datagram that claims to be a response is
+// dropped before anything else, which is what keeps two servers from answering each other for ever.
+pub fn is_response[&d](data: &d [byte]) -> [] bool {
+    return len(data) >= 4 && int_of(data[2]) >= 128;
+}
+
+// A FORMERR for a datagram too broken to answer with its question: its id (the first two bytes), QR, RA, the
+// recursion-desired bit as it was, RCODE 1, and no sections. Answers its length (12), or 0 when there is nothing to
+// say -- under four bytes (no flags to read), a response, or `out` smaller than 12 -- and then the datagram is dropped.
+pub fn encode_formerr[&o, &d](out: &!o [byte], data: &d [byte]) -> [] int {
+    if len(data) < 4 || len(out) < header_size() || is_response(data) {
+        return 0;
+    }
+    var p = put16(out, 0, u16_at(data, 0));
+    p = put16(out, p, 32768 + u16_at(data, 2) / 256 % 2 * 256 + 128 + 1);
+    p = put16(out, p, 0);
+    p = put16(out, p, 0);
+    p = put16(out, p, 0);
+    return put16(out, p, 0);
 }
