@@ -745,3 +745,42 @@ fn test_case_folding_is_exactly_the_ascii_letters() -> [] int {
     test.assert_eq(dns.fold(255), 255);
     return 0;
 }
+
+// RFC 2181 section 8: a TTL with the top bit set is zero. The largest TTL that is not, and the smallest that is.
+fn test_a_ttl_with_the_top_bit_set_is_zero() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](100, byte_of(0));
+        var start = record_start(data, 1, 1, 2147483647, 4, false);
+        put_pointers(data, start, 0);
+        test.assert_eq(dns.parse(data[0..start + 4], table), start + 4);
+        test.assert_eq(table[17], 2147483647);
+        start = record_start(data, 1, 1, 2147483648, 4, false);
+        test.assert_eq(dns.parse(data[0..start + 4], table), start + 4);
+        test.assert_eq(table[17], 0);
+        start = record_start(data, 1, 1, 4294967295, 4, false);
+        test.assert_eq(dns.parse(data[0..start + 4], table), start + 4);
+        test.assert_eq(table[17], 0);
+    }
+    return 0;
+}
+
+// A, AAAA and SRV are Internet-class types; in another class (here CHAOS, 3) their data is opaque and any length is
+// accepted. The name-bearing types are checked in every class.
+fn test_type_specific_data_is_checked_only_in_the_internet_class() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](100, byte_of(0));
+        var start = record_start(data, 1, 3, 60, 3, false);
+        test.assert_eq(dns.parse(data[0..start + 3], table), start + 3);
+        start = record_start(data, 28, 3, 60, 5, false);
+        test.assert_eq(dns.parse(data[0..start + 5], table), start + 5);
+        start = record_start(data, 33, 3, 60, 2, false);
+        test.assert_eq(dns.parse(data[0..start + 2], table), start + 2);
+        // NS data is a name in every class.
+        start = record_start(data, 2, 3, 60, 3, false);
+        put_pointers(data, start, 1);
+        test.assert_eq(dns.parse(data[0..start + 3], table), dns.error_bad_rdata());
+    }
+    return 0;
+}

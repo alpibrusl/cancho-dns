@@ -25,7 +25,8 @@ module dns;
 //     [9] index of the OPT record among the records, or -1
 //     [10] OPT: requested UDP payload size   [11] OPT: extended RCODE (high 8 bits)   [12] OPT: version
 //     [13] OPT: flags
-//     [14 + 6i ...] record i: name starts, type, class, ttl, rdata starts, rdata length
+//     [14 + 6i ...] record i: name starts, type, class, ttl (0 if the wire's has the top bit set, RFC 2181), rdata
+//                   starts, rdata length
 //
 // Records are numbered answer, then authority, then additional. `slots()` is how big the table has to be.
 
@@ -274,12 +275,16 @@ pub fn names_equal[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
 
 // Does the data of a record fit its type? `end` is where it must stop. Names inside are walked, so a later expansion
 // cannot meet a bad one.
-fn rdata_ok[&d](data: &d [byte], rtype: int, at: int, size: int) -> [] bool {
+//
+// A, AAAA and SRV are defined for the Internet class only: in another class their data is opaque here, as it is to a
+// resolver that forwards only IN (`docs/design.md` section 5). The types whose data is names are the same in every class.
+fn rdata_ok[&d](data: &d [byte], rtype: int, class: int, at: int, size: int) -> [] bool {
     let end = at + size;
-    if rtype == type_a() {
+    let internet = class == 1;
+    if rtype == type_a() && internet {
         return size == 4;
     }
-    if rtype == type_aaaa() {
+    if rtype == type_aaaa() && internet {
         return size == 16;
     }
     if rtype == type_ns() || rtype == type_cname() || rtype == type_ptr() || rtype == type_dname() {
@@ -291,7 +296,7 @@ fn rdata_ok[&d](data: &d [byte], rtype: int, at: int, size: int) -> [] bool {
         }
         return name_end(data, at + 2) == end;
     }
-    if rtype == type_srv() {
+    if rtype == type_srv() && internet {
         if size < 7 {
             return false;
         }
@@ -382,7 +387,7 @@ pub fn parse[&d, &t](data: &d [byte], table: &!t [int]) -> [] int {
         if start + size > len(data) {
             return error_truncated();
         }
-        if !rdata_ok(data, rtype, start, size) {
+        if !rdata_ok(data, rtype, class, start, size) {
             return error_bad_rdata();
         }
         if rtype == type_opt() {
@@ -406,7 +411,11 @@ pub fn parse[&d, &t](data: &d [byte], table: &!t [int]) -> [] int {
         table[row] = pos;
         table[row + 1] = rtype;
         table[row + 2] = class;
+        // RFC 2181 section 8: a TTL with the top bit set is zero.
         table[row + 3] = ttl;
+        if ttl >= 2147483648 {
+            table[row + 3] = 0;
+        }
         table[row + 4] = start;
         table[row + 5] = size;
         pos = start + size;
