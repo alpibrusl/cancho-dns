@@ -175,6 +175,15 @@ fn get64[&d](data: &d [byte], at: int) -> [] int {
 // or the entry would not fit `out`. A reply over `limit` bytes (0 for no limit) is the truncated form: header with TC, question,
 // OPT, no records.
 pub fn lookup[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], table: &t [int], out: &!o [byte], limit: int) -> [] int {
+    return read(cache, now, query, table, out, limit, true);
+}
+
+// `lookup` for the answer served straight after a reply was stored: the same entry, but it is not a hit (the ask was a miss).
+pub fn reread[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], table: &t [int], out: &!o [byte], limit: int) -> [] int {
+    return read(cache, now, query, table, out, limit, false);
+}
+
+fn read[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], table: &t [int], out: &!o [byte], limit: int, count: bool) -> [] int {
     let klen = make_key(cache, query, table[7], table[8]);
     if klen < 0 {
         return 0;
@@ -183,7 +192,9 @@ pub fn lookup[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], tabl
     store.tick(cache.store, now);
     let e = store.find(cache.store, key, store.hash_of(cache.store, key));
     if e < 0 {
-        bump(cache, 1);
+        if count {
+            bump(cache, 1);
+        }
         return 0;
     }
     let entry = store.value(cache.store, e);
@@ -220,7 +231,9 @@ pub fn lookup[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], tabl
         p = p + 10 + dns.u16_at(out, p + 8);
         k = k + 1;
     }
-    bump(cache, 0);
+    if count {
+        bump(cache, 0);
+    }
     if limit > 0 && p + extra > limit {
         // Too big for the client: TC, and nothing it would have to throw away.
         dns.put16(out, 2, 32768 + table[1] / 256 % 2 * 256 + 128 + 512 + int_of(msg[3]) % 16);
@@ -446,4 +459,99 @@ pub fn insert[&c, &q, &t, &r, &u](cache: &!c Cache, now: int, query: &q [byte], 
     }
     bump(cache, 2);
     return 0;
+}
+
+// ---------------------------------------------------------------------
+// Counters, for whoever asks `stats.bind. CH TXT`
+// ---------------------------------------------------------------------
+
+fn is_label[&d, &s](data: &d [byte], at: int, s: &s [byte]) -> [] bool {
+    if int_of(data[at]) != len(s) {
+        return false;
+    }
+    var i = 0;
+    while i < len(s) {
+        if dns.fold(int_of(data[at + 1 + i])) != int_of(s[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is the parsed query `stats.bind. CH TXT`?
+pub fn is_stats[&d, &t](data: &d [byte], table: &t [int]) -> [] bool {
+    if table[7] != 16 || table[8] != 3 || dns.name_end(data, dns.header_size()) != dns.header_size() + 12 {
+        return false;
+    }
+    return is_label(data, 12, "stats") && is_label(data, 18, "bind");
+}
+
+fn put_nat[&o](out: &!o [byte], at: int, n: int) -> [] int {
+    var digits = 1;
+    var rest = n / 10;
+    while rest > 0 {
+        digits = digits + 1;
+        rest = rest / 10;
+    }
+    var value = n;
+    var i = digits;
+    while i > 0 {
+        out[at + i - 1] = byte_of('0' + value % 10);
+        value = value / 10;
+        i = i - 1;
+    }
+    return at + digits;
+}
+
+// One character-string `<name>=<value>`.
+fn put_stat[&o, &s](out: &!o [byte], at: int, name: &s [byte], value: int) -> [] int {
+    var p = at + 1;
+    var i = 0;
+    while i < len(name) {
+        out[p] = name[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    out[p] = byte_of('=');
+    p = put_nat(out, p + 1, value);
+    out[at] = byte_of(p - at - 1);
+    return p;
+}
+
+// The reply to `stats.bind. CH TXT`: one TXT record whose strings are the counters. Answers its length, or `error_no_room`.
+pub fn stats_reply[&c, &q, &t, &o](cache: &c Cache, query: &q [byte], table: &t [int], out: &!o [byte]) -> [] int {
+    if len(out) < 512 {
+        return dns.error_no_room();
+    }
+    var p = dns.put16(out, 0, table[0]);
+    p = dns.put16(out, p, 32768 + table[1] / 256 % 2 * 256 + 128);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 0);
+    var i = dns.header_size();
+    while i < dns.header_size() + 16 {
+        out[i] = query[i];
+        i = i + 1;
+    }
+    p = dns.header_size() + 16;
+    p = dns.put16(out, p, 49164);
+    p = dns.put16(out, p, 16);
+    p = dns.put16(out, p, 3);
+    p = dns.put32(out, p, 0);
+    let rdlen = p;
+    p = p + 2;
+    p = put_stat(out, p, "hits", hits(cache));
+    p = put_stat(out, p, "misses", misses(cache));
+    p = put_stat(out, p, "stored", stored(cache));
+    p = put_stat(out, p, "uncacheable", uncacheable(cache));
+    p = put_stat(out, p, "no_room", no_room(cache));
+    p = put_stat(out, p, "evicted", evicted(cache));
+    p = put_stat(out, p, "expired", expired(cache));
+    p = put_stat(out, p, "live", live(cache));
+    p = put_stat(out, p, "used", used(cache));
+    p = put_stat(out, p, "capacity", capacity(cache));
+    dns.put16(out, rdlen, p - rdlen - 2);
+    return p;
 }

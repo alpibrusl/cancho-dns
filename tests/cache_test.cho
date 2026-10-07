@@ -57,7 +57,7 @@ fn ask[&c, &a, &o, &r](c: &!c cache.Cache, now: int, first: &a [byte], qtype: in
             test.assert(used > 0);
             test.assert_eq(dns.parse(upstream[0..used], utable), used);
             cache.insert(c, now, data[0..size], table, upstream[0..used], utable);
-            answer = cache.lookup(c, now, data[0..size], table, out, limit);
+            answer = cache.reread(c, now, data[0..size], table, out, limit);
             // The first answer was a miss: tell the caller so.
             test.assert(answer > 0);
             dns.parse(out[0..answer], rt);
@@ -95,7 +95,8 @@ fn test_a_hit_has_the_clients_id_and_its_ttls_run_down[&h](heap: &!h Heap) -> [h
             test.assert(ask(w, 1029000, "ttl30", 1, 0, 0, out, rt) > 0);
             test.assert_eq(ttl_of(rt, 0), 1);
             test.assert(ask(w, 1030000, "ttl30", 1, 0, 0, out, rt) < 0);
-            test.assert_eq(cache.hits(w), 5);
+            test.assert_eq(cache.hits(w), 3);
+            test.assert_eq(cache.misses(w), 2);
             test.assert_eq(cache.stored(w), 2);
         }
     }
@@ -174,7 +175,7 @@ fn test_names_that_differ_only_in_case_share_an_entry_and_the_client_sees_its_ow
             // The question in the reply is the client's: `WwW`.
             test.assert_eq(int_of(out[13]), 'W');
             test.assert_eq(int_of(out[14]), 'w');
-            test.assert_eq(cache.hits(w), 2);
+            test.assert_eq(cache.hits(w), 1);
             test.assert_eq(cache.stored(w), 1);
         }
     }

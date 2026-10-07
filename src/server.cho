@@ -5,11 +5,12 @@ import std.conns;
 import std.io;
 import dns;
 import stub;
+import cache;
 
 // `server` -- D1 of `docs/design.md`: UDP and TCP on one poller, answering from the stub (`src/stub.cho`) until there is a
 // cache and a forwarder.
 //
-//     server <port> [<idle seconds>]            (10 seconds)
+//     server <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys>]]]]     (10 seconds, 10 seconds, 16 MiB, 65,536 keys)
 //
 // One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection.
 //
@@ -75,6 +76,10 @@ res struct Core {
     datagram: Box[[byte]],
     // The ticket of the datagram's sender.
     who: Box[[int]],
+    // The answer cache, and the room for the stub's reply (the "upstream" until D3) and its parse table.
+    answers: cache.Cache,
+    upstream: Box[[byte]],
+    utable: Box[[int]],
 }
 
 // ---------------------------------------------------------------------
@@ -82,8 +87,10 @@ res struct Core {
 // ---------------------------------------------------------------------
 
 // Answer the message `data` into `out`: its length, or 0 for none (a response, or nothing to say). `udp` holds the reply to the size
-// the client can take; TCP does not.
-fn handle[&d, &t, &o](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool) -> [] int {
+// the client can take; TCP does not. A question the resolver can answer is looked up in the cache first; on a miss the stub (the
+// upstream, until there is a forwarder) answers into `up`, the reply goes through `cache.insert` exactly as a forwarded one will, and
+// the client is served from the entry; a reply that is not cacheable (a refusal, no SOA) is sent as it is.
+fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int) -> [] int {
     if dns.is_response(data) {
         return 0;
     }
@@ -93,6 +100,25 @@ fn handle[&d, &t, &o](data: &d [byte], table: &!t [int], out: &!o [byte], udp: b
     var limit = 0;
     if udp {
         limit = stub.udp_limit(table);
+    }
+    if cache.is_stats(data, table) {
+        return cache.stats_reply(answers, data, table, out);
+    }
+    let asks_cache = table[1] / 2048 % 16 == 0 && table[8] == 1 && table[7] != 251 && table[7] != 252 && (table[9] < 0 || table[12] == 0);
+    if asks_cache {
+        let hit = cache.lookup(answers, now, data, table, out, limit);
+        if hit > 0 {
+            return hit;
+        }
+        let used = stub.respond(up, data, table, 0);
+        if used > 0 && dns.parse(up[0..used], ut) == used {
+            if cache.insert(answers, now, data, table, up[0..used], ut) == 0 {
+                let served = cache.reread(answers, now, data, table, out, limit);
+                if served > 0 {
+                    return served;
+                }
+            }
+        }
     }
     let n = stub.respond(out, data, table, limit);
     if n < 0 {
@@ -107,18 +133,20 @@ fn handle[&d, &t, &o](data: &d [byte], table: &!t [int], out: &!o [byte], udp: b
 // ---------------------------------------------------------------------
 
 // Read and answer the datagrams waiting, up to the burst.
-fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core) -> [udp_recv, udp_send] int {
+fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_send] int {
     let tb = contents(core.table);
     let sc = contents(core.scratch);
     let dg = contents(core.datagram);
     let who = contents(core.who);
+    let up = contents(core.upstream);
+    let ut = contents(core.utable);
     var more = true;
     var turns = 0;
     while more && turns < udp_burst() {
         turns = turns + 1;
         match udp_recv_from(sock, dg, who) {
             Datagram::Got(n) => {
-                let sent = handle(dg[0..n], tb, sc, true);
+                let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now);
                 if sent > 0 {
                     udp_send_to(sock, sc[0..sent], who[0]);
                 }
@@ -195,12 +223,14 @@ fn settle[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [poll] int {
 
 // Answer every whole message buffered for connection `k`, queue or write the replies in order, and keep the start of one still
 // arriving. Closes the connection if it is to close or cannot be written to.
-fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write, poll] int {
+fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, now: int) -> [conn_write, poll] int {
     let st = contents(core.state);
     let bf = contents(core.bufs);
     let pd = contents(core.pends);
     let sc = contents(core.scratch);
     let tb = contents(core.table);
+    let up = contents(core.upstream);
+    let ut = contents(core.utable);
     let p = stride() * k;
     let base = k * input_size();
     let obase = k * output_size();
@@ -219,7 +249,7 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write,
                 going = false;
             } else {
                 let view = bf[base + used + 2..base + used + 2 + size];
-                let n = handle(view, tb, sc[2..len(sc)], false);
+                let n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now);
                 if n > 0 {
                     dns.put16(sc, 0, n);
                     st[p + 2] = emit(tab, k, sc[0..2 + n], pd[obase..obase + output_size()], st[p + 2]);
@@ -274,7 +304,7 @@ fn step[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, readiness: int, no
                             shut(tab, core, k);
                         } else {
                             // Held back while the last replies were being sent.
-                            process(tab, core, k);
+                            process(tab, core, k, now);
                         }
                     }
                 }
@@ -296,7 +326,7 @@ fn step[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, readiness: int, no
             Received::Data(got) => {
                 st[p] = st[p] + got;
                 st[p + 5] = now;
-                process(tab, core, k);
+                process(tab, core, k, now);
             }
             Received::End => {
                 shut(tab, core, k);
@@ -374,7 +404,7 @@ fn sweep[&t, &c](tab: &!t conns.Table, core: &!c Core, now: int, idle: int) -> [
 // The loop
 // ---------------------------------------------------------------------
 
-fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, clock: &k Clock, idle: int) -> [heap, conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
+fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, clock: &k Clock, idle: int, memory: int, keys: int, min_ttl: int) -> [heap, conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
     match poller_new() {
         Polling::Ok(p) => {
             var poller = p;
@@ -383,7 +413,7 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                 poller_add_udp(pw, sock, 1, 1);
             }
             let limit = max_connections();
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, 0, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0) };
             var tab = conns.empty(heap, 64);
             while true {
                 var ready = 0 - 1;
@@ -405,7 +435,7 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                         }
                     } else if token == 1 {
                         borrow mut core as &!cw in {
-                            serve_udp(sock, cw);
+                            serve_udp(sock, cw, now);
                         }
                     } else {
                         borrow mut tab as &!tw in {
@@ -420,12 +450,13 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                 }
                 borrow mut tab as &!tw in {
                     borrow mut core as &!cw in {
+                        cache.tick(cw.answers, now);
                         sweep(tw, cw, now, idle);
                     }
                 }
             }
             conns.drop(heap, tab);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who } = core;
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -435,6 +466,9 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
             unbox_slice(heap, scratch);
             unbox_slice(heap, datagram);
             unbox_slice(heap, who);
+            cache.close(heap, answers);
+            unbox_slice(heap, upstream);
+            unbox_slice(heap, utable);
             return 0;
         }
         Polling::Failed(e) => {
@@ -466,6 +500,9 @@ fn main(world: World) -> [] int {
     release(ffi);
     var port = 0 - 1;
     var idle = 10;
+    var min_ttl = 10;
+    var memory = 16777216;
+    var keys = 65536;
     borrow args as &g in {
         if arg_count(g) > 1 {
             port = number_of(arg(g, 1));
@@ -473,9 +510,18 @@ fn main(world: World) -> [] int {
         if arg_count(g) > 2 {
             idle = number_of(arg(g, 2));
         }
+        if arg_count(g) > 3 {
+            min_ttl = number_of(arg(g, 3));
+        }
+        if arg_count(g) > 4 {
+            memory = number_of(arg(g, 4));
+        }
+        if arg_count(g) > 5 {
+            keys = number_of(arg(g, 5));
+        }
     }
     var status = 2;
-    if port > 0 && port < 65536 && idle > 0 && idle < 86400 {
+    if port > 0 && port < 65536 && idle > 0 && idle < 86400 && min_ttl > 0 && min_ttl <= 3600 && memory >= 65536 && keys >= 16 {
         status = 3;
         borrow net as &nn in {
             match tcp_listen(nn, port, 128, 0) {
@@ -499,7 +545,7 @@ fn main(world: World) -> [] int {
                                             buffer.drop(h, line);
                                         }
                                         borrow clock as &c in {
-                                            status = run(h, lh, uh, c, idle * 1000);
+                                            status = run(h, lh, uh, c, idle * 1000, memory, keys, min_ttl);
                                         }
                                     }
                                 }
