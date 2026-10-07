@@ -1,0 +1,548 @@
+import std.test;
+import dns;
+
+// What `dns.parse` and the name functions answer, with no server: a real query and answer, each way of being
+// malformed, the limits at their edges, and -- the property the file is for -- that **no byte string of any of
+// these shapes makes the parser trap**.
+
+fn put8[&b](buf: &!b [byte], at: int, v: int) -> [] int {
+    buf[at] = byte_of(v);
+    return at + 1;
+}
+
+fn put16[&b](buf: &!b [byte], at: int, v: int) -> [] int {
+    buf[at] = byte_of(v / 256);
+    buf[at + 1] = byte_of(v % 256);
+    return at + 2;
+}
+
+fn put32[&b](buf: &!b [byte], at: int, v: int) -> [] int {
+    let p = put16(buf, at, v / 65536);
+    return put16(buf, p, v % 65536);
+}
+
+fn put_str[&b, &s](buf: &!b [byte], at: int, s: &s [byte]) -> [] int {
+    var i = 0;
+    while i < len(s) {
+        buf[at + i] = s[i];
+        i = i + 1;
+    }
+    return at + len(s);
+}
+
+// The header: id, flags, and the four counts.
+fn put_header[&b](buf: &!b [byte], id: int, flags: int, qd: int, an: int, ns: int, ar: int) -> [] int {
+    var p = put16(buf, 0, id);
+    p = put16(buf, p, flags);
+    p = put16(buf, p, qd);
+    p = put16(buf, p, an);
+    p = put16(buf, p, ns);
+    return put16(buf, p, ar);
+}
+
+// `example.com` at `at`, uncompressed; answers where it ends.
+fn put_example[&b](buf: &!b [byte], at: int) -> [] int {
+    var p = put8(buf, at, 7);
+    p = put_str(buf, p, "example");
+    p = put8(buf, p, 3);
+    p = put_str(buf, p, "com");
+    return put8(buf, p, 0);
+}
+
+// A query for `example.com A IN` with an OPT record asking for 1232 bytes. Answers its length.
+fn query[&b](buf: &!b [byte]) -> [] int {
+    var p = put_header(buf, 4660, 256, 1, 0, 0, 1);
+    p = put_example(buf, p);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 1);
+    p = put8(buf, p, 0);
+    p = put16(buf, p, 41);
+    p = put16(buf, p, 1232);
+    p = put32(buf, p, 0);
+    return put16(buf, p, 0);
+}
+
+// The same question answered once, the answer's name a compression pointer to the question's.
+fn response[&b](buf: &!b [byte]) -> [] int {
+    var p = put_header(buf, 4660, 33152, 1, 1, 0, 0);
+    p = put_example(buf, p);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 49164);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 1);
+    p = put32(buf, p, 300);
+    p = put16(buf, p, 4);
+    p = put8(buf, p, 192);
+    p = put8(buf, p, 0);
+    p = put8(buf, p, 2);
+    return put8(buf, p, 1);
+}
+
+fn test_the_header_must_be_all_here() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](11, byte_of(0));
+        test.assert_eq(dns.parse(data, table), dns.error_short_header());
+    }
+    return 0;
+}
+
+fn test_a_query_with_edns() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = query(data);
+        let message = data[0..size];
+        test.assert_eq(dns.parse(message, table), size);
+        test.assert_eq(table[0], 4660);
+        test.assert_eq(table[1], 256);
+        test.assert_eq(table[2], 1);
+        test.assert_eq(table[5], 1);
+        test.assert_eq(table[6], 12);
+        test.assert_eq(table[7], 1);
+        test.assert_eq(table[8], 1);
+        test.assert_eq(table[9], 0);
+        test.assert_eq(table[10], 1232);
+        test.assert_eq(table[11], 0);
+        test.assert_eq(table[12], 0);
+        test.assert_eq(table[13], 0);
+        test.assert_eq(table[15], 41);
+        test.assert_eq(table[19], 0);
+    }
+    return 0;
+}
+
+fn test_a_response_with_a_compressed_answer() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        let message = data[0..size];
+        test.assert_eq(dns.parse(message, table), size);
+        test.assert_eq(table[3], 1);
+        test.assert_eq(table[9], 0 - 1);
+        test.assert_eq(table[14], 29);
+        test.assert_eq(table[15], 1);
+        test.assert_eq(table[16], 1);
+        test.assert_eq(table[17], 300);
+        test.assert_eq(table[19], 4);
+        let name = alloc_slice[a](255, byte_of(0));
+        let n = dns.name_expand(message, table[14], name);
+        test.assert_eq(n, 13);
+        test.assert_eq(int_of(name[0]), 7);
+        test.assert_eq(int_of(name[8]), 3);
+        test.assert_eq(int_of(name[12]), 0);
+    }
+    return 0;
+}
+
+fn test_every_proper_prefix_of_a_message_is_refused_without_a_trap() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        var i = 0;
+        while i < size {
+            let r = dns.parse(data[0..i], table);
+            test.assert(r < 0);
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+fn test_trailing_bytes_are_refused() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        test.assert_eq(dns.parse(data[0..size + 1], table), dns.error_trailing_bytes());
+    }
+    return 0;
+}
+
+fn test_other_than_one_question_is_refused() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        put16(data, 4, 0);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_bad_counts());
+        put16(data, 4, 2);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_bad_counts());
+    }
+    return 0;
+}
+
+fn test_the_section_limits() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        put16(data, 6, 65);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_too_many_records());
+        put16(data, 6, 1);
+        put16(data, 8, 17);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_too_many_records());
+        put16(data, 8, 0);
+        put16(data, 10, 33);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_too_many_records());
+    }
+    return 0;
+}
+
+fn test_a_label_that_is_not_a_plain_label() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        put8(data, 12, 64);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_label_too_long());
+        put8(data, 12, 128);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_label_too_long());
+    }
+    return 0;
+}
+
+// The answer's name pointer: one that points at itself or forwards, or into the header, is refused; one at the
+// question is the normal case.
+fn test_a_compression_pointer_must_point_backwards_and_past_the_header() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        // The pointer sits at 29. Itself, forwards, and into the header.
+        put16(data, 29, 49152 + 29);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_bad_pointer());
+        put16(data, 29, 49152 + 40);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_bad_pointer());
+        put16(data, 29, 49152 + 11);
+        test.assert_eq(dns.parse(data[0..size], table), dns.error_bad_pointer());
+        put16(data, 29, 49152 + 12);
+        test.assert_eq(dns.parse(data[0..size], table), size);
+    }
+    return 0;
+}
+
+// A message whose answers are `hops` records: the first owned by a pointer to the question's name, each next one by a
+// pointer to the previous record's owner. (A pointer ends a name, so a chain has to go through other names.) The
+// last record's name is therefore `hops` pointers deep.
+fn hop_message[&b](buf: &!b [byte], hops: int) -> [] int {
+    // Names at the end of the message, each a pointer to the one before; the owner names of that many answers.
+    // We use `hops` answer records, record k owned by a pointer to record k-1's owner, record 0 by the question.
+    var p = put_header(buf, 1, 0, 1, hops, 0, 0);
+    p = put_example(buf, p);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 1);
+    var k = 0;
+    var previous = 12;
+    while k < hops {
+        let here = p;
+        p = put16(buf, p, 49152 + previous);
+        p = put16(buf, p, 16);
+        p = put16(buf, p, 1);
+        p = put32(buf, p, 0);
+        p = put16(buf, p, 0);
+        previous = here;
+        k = k + 1;
+    }
+    return p;
+}
+
+fn test_a_chain_of_pointers_is_followed_sixteen_times_and_no_more() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](400, byte_of(0));
+        // Record k's owner is a pointer to record k-1's owner, so record k follows k+1 pointers: 16 is allowed.
+        let ok = hop_message(data, 16);
+        test.assert_eq(dns.parse(data[0..ok], table), ok);
+        let name = alloc_slice[a](255, byte_of(0));
+        test.assert_eq(dns.name_expand(data[0..ok], table[14 + 6 * 15], name), 13);
+    }
+    region b {
+        let table = alloc_slice[b](dns.slots(), 0);
+        let data = alloc_slice[b](400, byte_of(0));
+        let over = hop_message(data, 17);
+        test.assert_eq(dns.parse(data[0..over], table), dns.error_bad_pointer());
+    }
+    return 0;
+}
+
+// Put `count` labels of `size` bytes each (all 'a'), then the root, at `at`; answers where it ends.
+fn put_labels[&b](buf: &!b [byte], at: int, count: int, size: int) -> [] int {
+    var p = at;
+    var k = 0;
+    while k < count {
+        p = put8(buf, p, size);
+        var j = 0;
+        while j < size {
+            p = put8(buf, p, 'a');
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    return put8(buf, p, 0);
+}
+
+fn test_a_name_is_at_most_255_bytes() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](400, byte_of(0));
+        // 3 labels of 63 (192 bytes), one of 61 (62 bytes) and the root: 255. One more byte is too long.
+        var p = put_header(data, 1, 0, 1, 0, 0, 0);
+        p = put_labels(data, p, 3, 63);
+        p = p - 1;
+        p = put8(data, p, 61);
+        var j = 0;
+        while j < 61 {
+            p = put8(data, p, 'a');
+            j = j + 1;
+        }
+        p = put8(data, p, 0);
+        p = put16(data, p, 1);
+        p = put16(data, p, 1);
+        test.assert_eq(dns.parse(data[0..p], table), p);
+        // Now 62: 256 bytes.
+        var q = put_header(data, 1, 0, 1, 0, 0, 0);
+        q = put_labels(data, q, 3, 63);
+        q = q - 1;
+        q = put8(data, q, 62);
+        var k = 0;
+        while k < 62 {
+            q = put8(data, q, 'a');
+            k = k + 1;
+        }
+        q = put8(data, q, 0);
+        q = put16(data, q, 1);
+        q = put16(data, q, 1);
+        test.assert_eq(dns.parse(data[0..q], table), dns.error_name_too_long());
+    }
+    return 0;
+}
+
+fn test_a_name_is_expanded_exactly() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = query(data);
+        let message = data[0..size];
+        test.assert_eq(dns.parse(message, table), size);
+        let small = alloc_slice[a](12, byte_of(0));
+        test.assert_eq(dns.name_expand(message, 12, small), dns.error_name_too_long());
+        let name = alloc_slice[a](13, byte_of(0));
+        test.assert_eq(dns.name_expand(message, 12, name), 13);
+    }
+    return 0;
+}
+
+fn test_names_compare_without_regard_to_case() -> [] int {
+    region a {
+        let x = alloc_slice[a](13, byte_of(0));
+        let y = alloc_slice[a](13, byte_of(0));
+        put_example(x, 0);
+        put_example(y, 0);
+        test.assert(dns.names_equal(x, y));
+        // Upper-case the first letter of `example`, and the whole of `com`.
+        y[1] = byte_of('E');
+        y[9] = byte_of('C');
+        y[10] = byte_of('O');
+        y[11] = byte_of('M');
+        test.assert(dns.names_equal(x, y));
+        y[11] = byte_of('N');
+        test.assert(!dns.names_equal(x, y));
+        test.assert(!dns.names_equal(x[0..12], y[0..12]));
+    }
+    return 0;
+}
+
+// ---- No input reaches a trap (docs/design.md section 8, gate 2) --------------------------------------------------
+
+// The eight bytes that matter to a name: the root, short labels, the longest plain label, the first bytes that are
+// not plain labels, a pointer prefix and a pointer target, and a letter.
+fn symbol(k: int) -> [] int {
+    if k == 0 {
+        return 0;
+    }
+    if k == 1 {
+        return 1;
+    }
+    if k == 2 {
+        return 3;
+    }
+    if k == 3 {
+        return 63;
+    }
+    if k == 4 {
+        return 64;
+    }
+    if k == 5 {
+        return 192;
+    }
+    if k == 6 {
+        return 12;
+    }
+    return 'a';
+}
+
+// How many strings of exactly `n` symbols there are: 8 to the n.
+fn power8(n: int) -> [] int {
+    var r = 1;
+    var i = 0;
+    while i < n {
+        r = r * 8;
+        i = i + 1;
+    }
+    return r;
+}
+
+// Every string of 0 to 6 bytes of `symbol`s, after a header's worth of zeros: whatever `name_end` answers is
+// either a refusal or a position inside the message after where the name started, and whatever it accepts,
+// `name_expand` expands to a whole name of at most 255 bytes.
+fn test_no_name_of_up_to_six_bytes_makes_the_parser_trap() -> [] int {
+    region a {
+        let data = alloc_slice[a](18, byte_of(0));
+        let out = alloc_slice[a](255, byte_of(0));
+        var n = 0;
+        var accepted = 0;
+        while n <= 6 {
+            var c = 0;
+            let total = power8(n);
+            while c < total {
+                var rest = c;
+                var j = 0;
+                while j < n {
+                    data[12 + j] = byte_of(symbol(rest % 8));
+                    rest = rest / 8;
+                    j = j + 1;
+                }
+                let end = dns.name_end(data[0..12 + n], 12);
+                if end >= 0 {
+                    test.assert(end > 12);
+                    test.assert(end <= 12 + n);
+                    accepted = accepted + 1;
+                    let size = dns.name_expand(data[0..12 + n], 12, out);
+                    test.assert(size > 0);
+                    test.assert(size <= 255);
+                } else {
+                    test.assert(dns.name_expand(data[0..12 + n], 12, out) < 0);
+                }
+                c = c + 1;
+            }
+            n = n + 1;
+        }
+        // Some strings are names: `\0`, `\1a\0`, and so on. If none were, the loop proved nothing.
+        test.assert(accepted > 1000);
+    }
+    return 0;
+}
+
+// A real message with every one byte replaced by every symbol, and every pair of bytes by every pair of
+// symbols: `parse` answers a refusal or the message's length, and a table whose counts it filled.
+fn test_no_one_or_two_byte_change_to_a_message_makes_the_parser_trap() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = response(data);
+        let original = alloc_slice[a](64, byte_of(0));
+        var m = 0;
+        while m < size {
+            original[m] = data[m];
+            m = m + 1;
+        }
+        var i = 0;
+        var accepted = 0;
+        while i < size {
+            var s = 0;
+            while s < 8 {
+                data[i] = byte_of(symbol(s));
+                var j = i;
+                while j < size {
+                    var t = 0;
+                    while t < 8 {
+                        data[j] = byte_of(symbol(t));
+                        let r = dns.parse(data[0..size], table);
+                        if r >= 0 {
+                            test.assert_eq(r, size);
+                            accepted = accepted + 1;
+                        }
+                        t = t + 1;
+                    }
+                    data[j] = original[j];
+                    j = j + 1;
+                }
+                data[i] = original[i];
+                s = s + 1;
+            }
+            i = i + 1;
+        }
+        // The changes that leave a valid message valid (a different address, a different TTL) are many.
+        test.assert(accepted > 100);
+    }
+    return 0;
+}
+
+// ---- Writing messages --------------------------------------------------------------------------------------------
+
+fn test_a_query_we_write_is_a_message_we_read() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let wire = alloc_slice[a](64, byte_of(0));
+        let name = alloc_slice[a](13, byte_of(0));
+        put_example(name, 0);
+        let out = alloc_slice[a](64, byte_of(0));
+        let n = dns.encode_query(out, 4242, name, 28, 1, 1232, true);
+        test.assert_eq(n, 12 + 13 + 4 + 11);
+        test.assert_eq(dns.parse(out[0..n], table), n);
+        test.assert_eq(table[0], 4242);
+        test.assert_eq(table[1], 256);
+        test.assert_eq(table[7], 28);
+        test.assert_eq(table[8], 1);
+        test.assert_eq(table[9], 0);
+        test.assert_eq(table[10], 1232);
+        // Without EDNS and without recursion desired.
+        let plain = dns.encode_query(out, 1, name, 1, 1, 0, false);
+        test.assert_eq(plain, 12 + 13 + 4);
+        test.assert_eq(dns.parse(out[0..plain], table), plain);
+        test.assert_eq(table[1], 0);
+        test.assert_eq(table[9], 0 - 1);
+        // And a buffer that is too small is an error, not a trap.
+        let small = alloc_slice[a](28, byte_of(0));
+        test.assert_eq(dns.encode_query(small, 1, name, 1, 1, 0, false), dns.error_no_room());
+    }
+    return 0;
+}
+
+fn test_an_error_reply_echoes_the_question_and_carries_the_rcode() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let reply_table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](64, byte_of(0));
+        let size = query(data);
+        test.assert_eq(dns.parse(data[0..size], table), size);
+        let out = alloc_slice[a](64, byte_of(0));
+        let n = dns.encode_error(out, data[0..size], table, 5, 1232);
+        test.assert_eq(n, 12 + 13 + 4 + 11);
+        test.assert_eq(dns.parse(out[0..n], reply_table), n);
+        test.assert_eq(reply_table[0], 4660);
+        // QR, the query's recursion-desired bit, RA, and RCODE 5 (REFUSED).
+        test.assert_eq(reply_table[1], 32768 + 256 + 128 + 5);
+        test.assert_eq(reply_table[7], 1);
+        test.assert_eq(reply_table[9], 0);
+        // An extended RCODE (BADVERS is 16) goes in the OPT record's high bits.
+        let m = dns.encode_error(out, data[0..size], table, 16, 1232);
+        test.assert_eq(dns.parse(out[0..m], reply_table), m);
+        test.assert_eq(reply_table[1] % 16, 0);
+        test.assert_eq(reply_table[11], 1);
+        // A query without an OPT gets an answer without one.
+        let name = alloc_slice[a](13, byte_of(0));
+        put_example(name, 0);
+        let bare = dns.encode_query(data, 9, name, 1, 1, 0, true);
+        test.assert_eq(dns.parse(data[0..bare], table), bare);
+        let k = dns.encode_error(out, data[0..bare], table, 2, 1232);
+        test.assert_eq(k, bare);
+        test.assert_eq(dns.parse(out[0..k], reply_table), k);
+        test.assert_eq(reply_table[5], 0);
+    }
+    return 0;
+}
