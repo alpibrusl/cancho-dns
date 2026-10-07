@@ -258,6 +258,16 @@ fn reply_head[&b](buf: &!b [byte], flags: int, an: int, ns: int, ar: int, qname:
     return dns.put16(buf, p, 1);
 }
 
+fn put_txt[&b](buf: &!b [byte], at: int, owner: int, ttl: int) -> [] int {
+    var p = put_name(buf, at, owner, 0);
+    p = dns.put16(buf, p, 16);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 2);
+    p = dns.put8(buf, p, 1);
+    return dns.put8(buf, p, 'x');
+}
+
 fn put_cname[&b](buf: &!b [byte], at: int, owner: int, target: int, ttl: int) -> [] int {
     var p = put_name(buf, at, owner, 0);
     p = dns.put16(buf, p, 5);
@@ -281,10 +291,11 @@ fn test_only_the_answer_chain_is_kept[&h](heap: &!h Heap) -> [heap] int {
             test.assert_eq(dns.parse(q[0..qn], qt), qn);
             // a.example A. Records: an A for b before the CNAME that makes b the name (dropped: out of order), a CNAME a -> b, an A for b
             // (kept), an A for w (planted: dropped); and an A for x in the additional section (dropped).
-            var p = reply_head(r, 33152, 4, 0, 1, 'a');
+            var p = reply_head(r, 33152, 5, 0, 1, 'a');
             p = put_a(r, p, 'b', 300, 9);
-            p = put_cname(r, p, 'a', 'b', 300);
-            p = put_a(r, p, 'b', 100, 8);
+            p = put_cname(r, p, 'a', 'b', 100);
+            p = put_a(r, p, 'b', 300, 8);
+            p = put_txt(r, p, 'b', 300);
             p = put_a(r, p, 'w', 300, 6);
             p = put_a(r, p, 'x', 300, 7);
             test.assert_eq(dns.parse(r[0..p], rt), p);
@@ -298,10 +309,61 @@ fn test_only_the_answer_chain_is_kept[&h](heap: &!h Heap) -> [heap] int {
             test.assert_eq(ot[14 + 6 + 1], 1);
             // The A that is kept is the one for b: its last byte is 8 (the planted ones were 9, 6 and 7).
             test.assert_eq(int_of(out[ot[14 + 6 + 4] + 3]), 8);
-            // The entry lives for the smaller of the kept TTLs (100): at 100 seconds it is gone, and the TTLs seen at 40 are 260 and 60.
-            test.assert_eq(ot[14 + 3], 299);
-            test.assert_eq(ot[14 + 6 + 3], 99);
+            // The entry lives for the smaller of the kept TTLs (the CNAME's 100, not the A's 300): at 100 seconds it is gone; at 1 second the
+            // TTLs seen are 99 and 299.
+            test.assert_eq(ot[14 + 3], 99);
+            test.assert_eq(ot[14 + 6 + 3], 299);
             test.assert(cache.lookup(w, 100000, q[0..qn], qt, out, 0) == 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn put_soa[&b](buf: &!b [byte], at: int, ttl: int, minimum: int) -> [] int {
+    var p = put_name(buf, at, 'z', 0);
+    p = dns.put16(buf, p, 6);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 42);
+    p = put_name(buf, p, 'm', 0);
+    p = put_name(buf, p, 'r', 0);
+    p = dns.put32(buf, p, 1);
+    p = dns.put32(buf, p, 2);
+    p = dns.put32(buf, p, 3);
+    p = dns.put32(buf, p, 4);
+    return dns.put32(buf, p, minimum);
+}
+
+fn test_a_negative_answer_lives_for_the_smaller_of_the_soas_ttl_and_minimum[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let q = alloc_slice[g](512, byte_of(0));
+            let r = alloc_slice[g](2048, byte_of(0));
+            let out = alloc_slice[g](4096, byte_of(0));
+            let qt = alloc_slice[g](dns.slots(), 0);
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let qn = query_a(q);
+            test.assert_eq(dns.parse(q[0..qn], qt), qn);
+            // NXDOMAIN, SOA TTL 300, MINIMUM 20: it lasts 20 seconds, and the SOA is served with 20 (not 300) on it.
+            var p = reply_head(r, 33152 + 3, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 20);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 0);
+            let n = cache.lookup(w, 5000, q[0..qn], qt, out, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], rt), n);
+            test.assert_eq(rt[14 + 3], 15);
+            test.assert(cache.lookup(w, 19999, q[0..qn], qt, out, 0) > 0);
+            test.assert(cache.lookup(w, 20000, q[0..qn], qt, out, 0) == 0);
+            // And a MINIMUM under the floor is raised to it: 10 seconds.
+            p = reply_head(r, 33152 + 3, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 2);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 100000, q[0..qn], qt, r[0..p], rt), 0);
+            test.assert(cache.lookup(w, 109999, q[0..qn], qt, out, 0) > 0);
+            test.assert(cache.lookup(w, 110000, q[0..qn], qt, out, 0) == 0);
         }
     }
     cache.close(heap, c);
@@ -323,8 +385,15 @@ fn test_a_reply_that_is_not_for_the_question_or_not_an_answer_is_not_cached[&h](
             p = put_a(r, p, 'b', 300, 1);
             test.assert_eq(dns.parse(r[0..p], rt), p);
             test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            // A reply whose question is the same name but another type (AAAA).
+            p = reply_head(r, 33152, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 300);
+            dns.put16(r, 12 + 11, 28);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
             // Truncated (TC), REFUSED, and NXDOMAIN with no SOA are not cached either.
-            p = reply_head(r, 33152 + 512, 0, 0, 0, 'a');
+            p = reply_head(r, 33152 + 512, 1, 0, 0, 'a');
+            p = put_a(r, p, 'a', 300, 1);
             test.assert_eq(dns.parse(r[0..p], rt), p);
             test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
             p = reply_head(r, 33152 + 5, 0, 0, 0, 'a');
@@ -334,7 +403,7 @@ fn test_a_reply_that_is_not_for_the_question_or_not_an_answer_is_not_cached[&h](
             test.assert_eq(dns.parse(r[0..p], rt), p);
             test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
             test.assert_eq(cache.stored(w), 0);
-            test.assert_eq(cache.uncacheable(w), 4);
+            test.assert_eq(cache.uncacheable(w), 5);
             // SERVFAIL is kept, for five seconds.
             p = reply_head(r, 33152 + 2, 0, 0, 0, 'a');
             test.assert_eq(dns.parse(r[0..p], rt), p);
