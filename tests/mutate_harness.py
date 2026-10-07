@@ -44,8 +44,9 @@ VARIANTS = [
 
 
 def main():
-    cancho = sys.argv[1]
-    python = sys.argv[2] if len(sys.argv) > 2 else sys.executable
+    # Absolute, because each variant is built from a scratch directory, where a relative path means something else.
+    cancho = os.path.abspath(sys.argv[1])
+    python = shutil.which(sys.argv[2]) if len(sys.argv) > 2 else sys.executable
     source = open(os.path.join(ROOT, "src", "dns.cho")).read()
     survivors, invalid = [], []
     work = tempfile.mkdtemp(prefix="mutharness-")
