@@ -210,7 +210,9 @@ Any of these is written up here, in place, as the result.
 `src/dns.cho` is the codec (`parse`, `name_end`, `name_expand`, `encode_query`, `encode_error`), `tests/dns_test.cho` its tests, `tests/driver.cho`
 the codec behind a pipe, `tests/differential_codec.py` gate 1, `tests/mutate_harness.py` gate 1's own mutation test, `tests/authority_check.py` and
 `authority/codec.ceiling` gate 6, and `.github/workflows/ci.yml` runs all of it on a compiler pinned by revision. Measured on cancho
-`0567e72` with the debug build; **CI's first run on this change is the result that counts for the pinned release build**, and is not yet in.
+`0567e72` with the debug build, and **re-run in CI on the pinned release build, where every step passes** (formatting, the 24 codec tests, the differential with
+the same counts as below, the 19 wrong codecs, the authority gate and the gate shown able to fail). CI's first run failed on a path bug in
+`mutate_harness.py` (a relative compiler path from a scratch directory), not in the codec; the steps before it, the differential included, had passed.
 
 **Gate 2 (no input reaches a trap), as met.** `cancho test`: 24 tests. The name parser is run over **every byte string of 0 to 6 bytes over eight
 symbols (299,593 of them)** after a header's worth of bytes (so pointers can land): each is refused or ends inside the message, and `name_expand`
