@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cancho-dns: a DNS resolver you can audit</title>
+<meta name="description" content="A forwarding and caching DNS resolver written in cancho: a bounded parser, a fixed arena, and an authority report that names the upstreams it can reach. Design stage.">
+<meta property="og:title" content="cancho-dns: a DNS resolver you can audit">
+<meta property="og:description" content="A bounded, capability-limited DNS resolver in cancho. Design stage: nothing is built yet.">
+<meta property="og:image" content="https://alpibrusl.github.io/cancho-dns/assets/cancho-dns-logo-256.png">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/png" href="assets/cancho-dns-icon-64.png">
+<style>
+:root {
+  --bg: #fbfcfd; --fg: #14181a; --muted: #55606a; --line: #dfe5e7; --surface: #ffffff; --soft: #eff4f4;
+  --accent: #1f5fa6; --accent-fg: #ffffff; --good: #0f7b5f; --warn: #92400e; --warn-bg: #fdf6e7; --warn-line: #e0b765; --bad: #b42d27;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0b0f14; --fg: #e7ebec; --muted: #9aa8ae; --line: #212a2d; --surface: #131a1c; --soft: #172022;
+    --accent: #7fb2ff; --accent-fg: #07162c; --good: #4fd1a5; --warn: #f3c77a; --warn-bg: #1d1a12; --warn-line: #8a6a2a; --bad: #ff7b73; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; scroll-padding-top: 4rem; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 1rem/1.6 var(--font); }
+a { color: var(--accent); text-underline-offset: .15em; }
+.wrap { width: 100%; max-width: 68rem; margin: 0 auto; padding: 0 16px; }
+.skip { position: absolute; left: 16px; top: -4rem; background: var(--accent); color: var(--accent-fg); padding: .5rem .8rem; border-radius: 6px; z-index: 9; }
+.skip:focus { top: 8px; }
+a:focus-visible, .btn:focus-visible, pre:focus-visible, summary:focus-visible, .fitwrap:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+header.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 1.5rem; height: 3.4rem; }
+.brand { display: inline-flex; align-items: center; gap: .5rem; font: 700 1rem var(--mono); color: var(--fg); text-decoration: none; letter-spacing: -.01em; white-space: nowrap; }
+nav { display: flex; gap: 1.2rem; margin-left: auto; }
+nav a { color: var(--muted); text-decoration: none; font-size: .93rem; white-space: nowrap; }
+nav a:hover { color: var(--fg); }
+@media (max-width: 40rem) { nav a.opt { display: none; } nav { gap: .9rem; } }
+
+h1 { font-size: clamp(2.1rem, 6vw, 3.8rem); line-height: 1.06; letter-spacing: -.035em; margin: 0 0 1rem; font-weight: 750; overflow-wrap: break-word; }
+h2 { font-size: clamp(1.5rem, 3.4vw, 2.1rem); line-height: 1.15; letter-spacing: -.025em; margin: 0 0 .5rem; font-weight: 700; }
+h3 { font-size: 1.05rem; margin: 0 0 .25rem; }
+p { margin: 0 0 1rem; }
+section { padding: 4.5rem 0 0; }
+.lead { font-size: 1.2rem; color: var(--muted); max-width: 34rem; }
+.sub { color: var(--muted); max-width: 40rem; }
+code { font-family: var(--mono); font-size: .9em; background: var(--soft); padding: .1em .35em; border-radius: 5px; overflow-wrap: anywhere; }
+
+.hero { padding: 3.5rem 0 0; display: grid; gap: 2.2rem; align-items: center; }
+.hero > *, .two > *, .cols > * { min-width: 0; }
+@media (min-width: 58rem) { .hero { grid-template-columns: 1fr 1.1fr; } }
+.badge { display: inline-flex; gap: .5rem; align-items: center; font-size: .82rem; color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-line); padding: .22rem .7rem; border-radius: 999px; margin-bottom: 1.2rem; text-decoration: none; }
+.badge i { width: .5rem; height: .5rem; border-radius: 50%; background: var(--warn-line); display: inline-block; flex: none; }
+.cta { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.6rem; }
+.btn { display: inline-block; padding: .65rem 1.15rem; border-radius: 8px; font-weight: 600; text-decoration: none; border: 1px solid var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); }
+.btn.ghost { color: var(--accent); }
+.btn.ghost:hover { background: var(--soft); }
+
+.term { background: #0d1117; color: #d6dde8; border: 1px solid #262c36; border-radius: 12px; font: .82rem/1.6 var(--mono); padding: 1rem 1.1rem 1.1rem; box-shadow: 0 18px 50px -24px rgba(10, 40, 40, .55); overflow-x: auto; }
+.term .bar { display: flex; gap: .35rem; margin-bottom: .8rem; }
+.term .bar i { width: .65rem; height: .65rem; border-radius: 50%; background: #2d3440; display: block; }
+.term .c { color: #8b95a5; } .term .r { color: #ff9a92; }
+.term pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.three { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); margin-top: 3rem; }
+.three div { border-top: 3px solid var(--accent); padding-top: .8rem; }
+.three p { color: var(--muted); margin: 0; font-size: .96rem; }
+
+.figure { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 1.2rem; min-width: 0; }
+.figure.wide { margin-top: 2rem; }
+.figure svg { display: block; width: 100%; height: auto; }
+.figure h3 { margin-bottom: .6rem; }
+.figure figcaption { color: var(--muted); font-size: .88rem; margin-top: .8rem; }
+.two { display: grid; gap: 1rem; grid-template-columns: 1fr; margin-top: 2rem; }
+@media (min-width: 52rem) { .two { grid-template-columns: 1fr 1fr; } }
+svg .t { fill: var(--fg); font: 600 13px var(--font); } svg .s { fill: var(--muted); font: 12px var(--font); }
+svg .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.4; } svg .hot { fill: var(--soft); stroke: var(--accent); stroke-width: 2; }
+svg .ar { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+
+.grid { display: grid; gap: 1px; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin-top: 2rem; }
+.grid div { background: var(--surface); padding: 1.1rem 1.2rem; }
+.grid p { color: var(--muted); font-size: .93rem; margin: 0; }
+
+.stats { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); margin: 2rem 0 0; }
+.stats div { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; }
+.stats b { display: block; font: 700 1.9rem/1.1 var(--font); letter-spacing: -.03em; }
+.stats span { color: var(--muted); font-size: .88rem; }
+.note { color: var(--muted); font-size: .88rem; margin-top: .9rem; }
+
+pre.code { background: var(--soft); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; font: .84rem/1.6 var(--mono); overflow-x: auto; margin: 1.4rem 0 0; }
+.figure pre.code { margin-top: .4rem; }
+pre.code .c { color: var(--muted); } pre.code .r { color: var(--bad); }
+.status { margin-top: 4.5rem; background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 14px; padding: 1.3rem 1.5rem; }
+.status h2 { font-size: 1.2rem; letter-spacing: -.01em; }
+.status ul { margin: .4rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+footer { margin-top: 4rem; border-top: 1px solid var(--line); padding: 1.6rem 0 2.6rem; color: var(--muted); font-size: .9rem; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; }
+.fitwrap { overflow-x: auto; margin-top: 1.4rem; }
+table.fit { width: 100%; border-collapse: collapse; font-size: .93rem; }
+table.fit th, table.fit td { text-align: left; padding: .7rem .8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.fit thead th { color: var(--muted); font-weight: 600; font-size: .85rem; }
+table.fit tbody th { font-weight: 650; }
+table.fit td { color: var(--muted); }
+table.fit.auth tbody th { white-space: nowrap; }
+table.fit .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.fit.wide { min-width: 38rem; } table.fit.bench { min-width: 44rem; }
+table.fit tr.us { background: var(--soft); } table.fit tr.us td, table.fit tr.us th { color: var(--fg); }
+table.fit td.lose { color: var(--bad); font-weight: 600; } table.fit td.win { color: var(--good); font-weight: 600; }
+.cols { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); margin-top: 1.4rem; }
+.cols > div { border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.3rem; background: var(--surface); }
+.cols ul { margin: .4rem 0 0; padding-left: 1.1rem; color: var(--muted); } .cols li { margin: .25rem 0; }
+.cols .no h3 { color: var(--muted); }
+details.rules { margin-top: 1.4rem; } details.rules summary { cursor: pointer; font-weight: 600; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+h3.task { margin: 0 0 .15rem; font-size: 1.1rem; }
+.task + p { color: var(--muted); margin: 0 0 .2rem; max-width: 42rem; }
+.tasks { display: grid; gap: 1.6rem; margin-top: 2rem; grid-template-columns: minmax(0, 1fr); }
+.tasks > * { min-width: 0; }
+.tasks pre.code { margin-top: .6rem; }
+ul.plain { color: var(--muted); padding-left: 1.2rem; } ul.plain li { margin: .35rem 0; }
+.fn { color: var(--muted); font-size: .85rem; margin-top: .8rem; }
+svg .tt { fill: var(--fg); font: 600 13px var(--font); } svg .ss { fill: var(--muted); font: 11.5px var(--font); }
+svg .bad { fill: var(--surface); stroke: var(--bad); stroke-width: 1.6; } svg .arb { stroke: var(--bad); stroke-width: 1.5; fill: none; }
+.diagram { max-width: 26rem; margin: 1.6rem auto 0; }
+ul.why { list-style: none; padding: 0; margin: 1.4rem 0 0; display: grid; gap: .8rem; }
+ul.why li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: .8rem 1.1rem; }
+ul.why b { display: block; }
+ul.why span { color: var(--muted); font-size: .95rem; }
+.big { font-size: 1.25rem; font-weight: 650; letter-spacing: -.01em; margin: 1.2rem 0 0; }
+.brand { display: inline-flex; align-items: center; gap: .5rem; }
+.brand .mark { border-radius: 6px; background: #fff; }
+.brand .mark { border-radius: 6px; background: #fff; }
+.hero .logo { width: 100%; max-width: 15rem; height: auto; justify-self: center; border-radius: 16px; background: #fff; }
+</style>
+</head>
+<body id="top">
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#top"><img class="mark" src="assets/cancho-dns-icon-64.png" alt="" width="28" height="28">dns</a>
+  <nav aria-label="Sections"><a href="#why">Why</a><a href="#v1">v1</a><a href="#built">How it is built</a><a href="#fit">Where it fits</a><a href="#plan">Plan</a><a href="https://github.com/alpibrusl/cancho-dns">GitHub</a></nav>
+</div></header>
+<main id="main"><div class="wrap">
+
+<section class="hero" style="padding-top:3.5rem">
+  <div>
+    <p class="badge"><i></i>Design stage &middot; nothing is built yet</p>
+    <h1>A DNS resolver you can audit.</h1>
+    <p class="lead">A forwarding and caching resolver written in cancho: a bounded parser, a fixed arena, and an authority report that names the upstreams it can reach and nothing else.</p>
+    <p class="sub">DNS is on every network, and its resolvers have a long history of memory-safety bugs in the code that parses packets. <code>cancho-dns</code> is the same job with no <code>Ffi</code> and no <code>unsafe</code>, and with limits that are checked, not hoped for.</p>
+    <div class="cta"><a class="btn primary" href="#v1">What v1 will do</a><a class="btn ghost" href="https://github.com/alpibrusl/cancho-dns/issues/17">The plan</a></div>
+  </div>
+  <img class="logo" src="assets/cancho-dns-logo-256.png" alt="cancho-dns: a granite spire among rocks, with arrows tracing queries around it" width="256" height="256">
+</section>
+
+<section id="why">
+  <h2>Why a resolver, and why cancho</h2>
+  <p class="sub">A resolver parses untrusted packets from the network all day, and holds a cache an attacker would like to poison. That makes two properties worth having and worth proving.</p>
+  <div class="grid">
+    <div><h3>The parser cannot be tricked into a crash</h3><p>Every input is bounded, every refusal has a rule tag, and no input reaches a panic. Name compression pointers, record counts and message sizes all have limits with their own refusals.</p></div>
+    <div><h3>The program can only reach its upstreams</h3><p>The authority report is derived by the compiler. The aim is for it to name the exact upstream addresses, so a bug in the parser cannot make the resolver talk to arbitrary hosts.</p></div>
+    <div><h3>Memory is sized at start</h3><p>The cache lives in a fixed arena, as in <a href="https://github.com/alpibrusl/cancho-cache">cancho-cache</a>. Nothing grows without bound, and pauses are bounded by a slice of work.</p></div>
+    <div><h3>Built to be read by an agent</h3><p>Errors are data with stable rule tags and repairs, a <code>check</code> and an <code>explain</code> command say what a configuration or a query would do without sending anything, and the tool describes itself.</p></div>
+  </div>
+</section>
+
+<section id="v1">
+  <h2>What v1 will do</h2>
+  <p class="sub">A forwarding cache first. Everything here is a plan, written down in the epic, and nothing is promised until it is built and measured.</p>
+  <div class="cols">
+    <div><h3>In v1</h3><ul>
+      <li>DNS over UDP and TCP, with EDNS0 and truncation</li>
+      <li>A cache with TTLs, negative caching and LRU eviction in a fixed arena</li>
+      <li>Forwarding to a fixed set of upstream resolvers, with timeouts and health</li>
+      <li>Local records from a small bounded file, and overrides</li>
+      <li>Defences that matter: random transaction IDs and ports, 0x20 case randomisation, bailiwick checks, response rate limiting</li>
+      <li>Bounded JSON logs and metrics, with no files written</li>
+    </ul></div>
+    <div class="no"><h3>Not in v1</h3><ul>
+      <li>Iterating from the root servers (a later stage)</li>
+      <li>DNSSEC validation (stage 2: cancho already has RSA, ECDSA and Ed25519)</li>
+      <li>DNS over TLS and HTTPS (TLS needs foreign code today, which would make the authority report unbounded)</li>
+      <li>Zone transfers, dynamic update, views, clustering</li>
+    </ul></div>
+  </div>
+</section>
+
+<section id="built">
+  <h2>How it is built</h2>
+  <p class="sub">One thread and one poller, as in the cache. This is the target row, not a measured one: it will be derived by <code>cancho authority</code> and checked in CI against a ceiling file, and it is what the design document has to settle first.</p>
+  <div class="term" role="img" aria-label="The target authority row, a design aim"><div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="c"># target, not built: what the compiler should report for the resolver</span>
+args, clock, heap, io_write, net_in("0.0.0.0:53"), net_out(<span class="c">the configured upstreams</span>)
+<span class="c"># and no file, no ffi</span></pre></div>
+  <p class="note">One open question is real: the compiler narrows a capability to a <em>literal</em>, so an upstream list read from a file at run time cannot be proven. The design has to choose between a generated, compiled-in upstream set (exact proof, one binary per deployment), a coarser label enforced in code, or a mix. The README's claim is conditional on that answer.</p>
+</section>
+
+<section id="fit">
+  <h2>Where it fits</h2>
+  <p class="sub">The yardsticks are the resolvers people run. We will measure against them with the cells fixed before the code, and report losses as plainly as wins.</p>
+  <div class="cols">
+    <div><h3>Unbound</h3><ul><li>The reference validating, caching resolver</li><li>C, mature, DNSSEC and recursion</li></ul></div>
+    <div><h3>dnsmasq</h3><ul><li>Small forwarder for routers and labs</li><li>C, with a record of parser CVEs</li></ul></div>
+    <div><h3>CoreDNS</h3><ul><li>Plugin-based, common in Kubernetes</li><li>Go, a different shape of tool</li></ul></div>
+    <div><h3>Knot Resolver</h3><ul><li>Fast, validating, scripted</li><li>C and Lua</li></ul></div>
+  </div>
+  <p class="note">Expectation, stated before measuring: a DNS packet is tiny, so throughput is limited by the kernel as much as by us. The honest aim is parity per core with much lower memory, and a security story the others cannot tell. A big speed win is not the claim.</p>
+</section>
+
+<section id="plan">
+  <h2>Plan</h2>
+  <p class="sub">The design document comes first, and every later task depends on it: scope, the authority row, the cache and security policy, the gates, and the benchmark cells, all fixed before any code. The epic lists the tasks in the order they would be taken: <a href="https://github.com/alpibrusl/cancho-dns/issues/17">cancho-dns#17</a>.</p>
+</section>
+
+<section id="status">
+  <h2>Status</h2>
+  <p class="sub"><strong>Design stage.</strong> There is a README, a logo and an epic with its tasks. There is no code, no benchmark and no claim beyond what is written above.</p>
+</section>
+
+</div></main>
+<footer><div class="wrap"><p class="note">Part of the <a href="https://github.com/alpibrusl/cancho">cancho</a> family. Licence: <a href="https://github.com/alpibrusl/cancho-dns/blob/main/LICENSE">EUPL-1.2</a>.</p></div></footer>
+</body>
+</html>
