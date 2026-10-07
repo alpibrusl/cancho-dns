@@ -144,8 +144,9 @@ fn test_every_proper_prefix_of_a_message_is_refused_without_a_trap() -> [] int {
         let size = response(data);
         var i = 0;
         while i < size {
+            // A message cut short is short or truncated: never "trailing", never "bad rdata".
             let r = dns.parse(data[0..i], table);
-            test.assert(r < 0);
+            test.assert(r == dns.error_short_header() || r == dns.error_truncated());
             i = i + 1;
         }
     }
@@ -544,5 +545,203 @@ fn test_an_error_reply_echoes_the_question_and_carries_the_rcode() -> [] int {
         test.assert_eq(dns.parse(out[0..k], reply_table), k);
         test.assert_eq(reply_table[5], 0);
     }
+    return 0;
+}
+
+// ---- Records and EDNS ----------------------------------------------------------------------------------------------
+
+// A message with one question (`example.com`) and one record whose owner is a pointer to it, of type `rtype`, `size`
+// bytes of data that the caller fills in starting at the answer: the record is in the answer section, or in the
+// additional section if `extra`. Answers where the data starts.
+fn record_start[&b](buf: &!b [byte], rtype: int, class: int, ttl: int, size: int, extra: bool) -> [] int {
+    var an = 1;
+    var ar = 0;
+    if extra {
+        an = 0;
+        ar = 1;
+    }
+    var p = put_header(buf, 1, 0, 1, an, 0, ar);
+    p = put_example(buf, p);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 1);
+    p = put16(buf, p, 49164);
+    p = put16(buf, p, rtype);
+    p = put16(buf, p, class);
+    p = put32(buf, p, ttl);
+    return put16(buf, p, size);
+}
+
+// `count` pointers to the question's name, from `at`.
+fn put_pointers[&b](buf: &!b [byte], at: int, count: int) -> [] int {
+    var p = at;
+    var k = 0;
+    while k < count {
+        p = put16(buf, p, 49164);
+        k = k + 1;
+    }
+    return p;
+}
+
+// Does a record of `rtype` with `size` bytes of data (a pointer to the question first, then zeros, so a name-bearing
+// type has a valid name at its front) pass?
+fn verdict(rtype: int, size: int) -> [] int {
+    var r = 0;
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](200, byte_of(0));
+        let start = record_start(data, rtype, 1, 60, size, false);
+        if size >= 2 {
+            put_pointers(data, start, 1);
+        }
+        r = dns.parse(data[0..start + size], table);
+    }
+    return r;
+}
+
+fn test_a_and_aaaa_data_have_their_lengths() -> [] int {
+    test.assert(verdict(1, 4) > 0);
+    test.assert_eq(verdict(1, 3), dns.error_bad_rdata());
+    test.assert_eq(verdict(1, 5), dns.error_bad_rdata());
+    test.assert(verdict(28, 16) > 0);
+    test.assert_eq(verdict(28, 15), dns.error_bad_rdata());
+    test.assert_eq(verdict(28, 17), dns.error_bad_rdata());
+    // Types the parser does not look inside are opaque, whatever their length.
+    test.assert(verdict(16, 0) > 0);
+    test.assert(verdict(99, 50) > 0);
+    return 0;
+}
+
+fn test_a_name_in_record_data_must_fill_it_exactly() -> [] int {
+    // NS (2), CNAME (5), PTR (12) and DNAME (39): a pointer is a whole name; anything after it is not data.
+    test.assert(verdict(2, 2) > 0);
+    test.assert(verdict(5, 2) > 0);
+    test.assert(verdict(12, 2) > 0);
+    test.assert(verdict(39, 2) > 0);
+    test.assert_eq(verdict(2, 3), dns.error_bad_rdata());
+    test.assert_eq(verdict(5, 4), dns.error_bad_rdata());
+    // One byte that begins a pointer and does not finish it.
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](100, byte_of(0));
+        let start = record_start(data, 2, 1, 60, 1, false);
+        put8(data, start, 192);
+        test.assert_eq(dns.parse(data[0..start + 1], table), dns.error_bad_rdata());
+    }
+    return 0;
+}
+
+fn test_mx_srv_and_soa_data() -> [] int {
+    // MX: preference (2) then a name.
+    test.assert_eq(verdict(15, 2), dns.error_bad_rdata());
+    test.assert_eq(verdict(15, 5), dns.error_bad_rdata());
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](200, byte_of(0));
+        // MX with its pointer after the preference.
+        var start = record_start(data, 15, 1, 60, 4, false);
+        put16(data, start, 10);
+        put_pointers(data, start + 2, 1);
+        test.assert_eq(dns.parse(data[0..start + 4], table), start + 4);
+        // SRV: priority, weight and port (6) then a name.
+        start = record_start(data, 33, 1, 60, 8, false);
+        put_pointers(data, start + 6, 1);
+        test.assert_eq(dns.parse(data[0..start + 8], table), start + 8);
+        start = record_start(data, 33, 1, 60, 6, false);
+        test.assert_eq(dns.parse(data[0..start + 6], table), dns.error_bad_rdata());
+        // SOA: two names then 20 bytes. 24 with two pointers; 23 and 25 do not fit.
+        start = record_start(data, 6, 1, 60, 24, false);
+        put_pointers(data, start, 2);
+        test.assert_eq(dns.parse(data[0..start + 24], table), start + 24);
+        start = record_start(data, 6, 1, 60, 23, false);
+        put_pointers(data, start, 2);
+        test.assert_eq(dns.parse(data[0..start + 23], table), dns.error_bad_rdata());
+        start = record_start(data, 6, 1, 60, 25, false);
+        put_pointers(data, start, 2);
+        test.assert_eq(dns.parse(data[0..start + 25], table), dns.error_bad_rdata());
+    }
+    return 0;
+}
+
+fn test_an_opt_record_is_one_root_owned_record_with_tiled_options() -> [] int {
+    region a {
+        let table = alloc_slice[a](dns.slots(), 0);
+        let data = alloc_slice[a](100, byte_of(0));
+        // The well-formed OPT: owner root (1 byte), type, class 1232, ttl 0x01028000, no options.
+        var p = put_header(data, 1, 0, 1, 0, 0, 1);
+        p = put_example(data, p);
+        p = put16(data, p, 1);
+        p = put16(data, p, 1);
+        let opt = p;
+        p = put8(data, p, 0);
+        p = put16(data, p, 41);
+        p = put16(data, p, 1232);
+        p = put32(data, p, 16941056);
+        p = put16(data, p, 8);
+        p = put16(data, p, 10);
+        p = put16(data, p, 4);
+        p = put32(data, p, 7);
+        test.assert_eq(dns.parse(data[0..p], table), p);
+        test.assert_eq(table[9], 0);
+        test.assert_eq(table[10], 1232);
+        test.assert_eq(table[11], 1);
+        test.assert_eq(table[12], 2);
+        test.assert_eq(table[13], 32768);
+        // Options that do not tile the data: a length longer than what is left.
+        put16(data, opt + 13, 5);
+        test.assert_eq(dns.parse(data[0..p], table), dns.error_bad_edns());
+        put16(data, opt + 13, 4);
+        // A non-root owner: a pointer where the root was (it makes the record two bytes longer, so rebuild).
+        var q = put_header(data, 1, 0, 1, 0, 0, 1);
+        q = put_example(data, q);
+        q = put16(data, q, 1);
+        q = put16(data, q, 1);
+        q = put16(data, q, 49164);
+        q = put16(data, q, 41);
+        q = put16(data, q, 1232);
+        q = put32(data, q, 0);
+        q = put16(data, q, 0);
+        test.assert_eq(dns.parse(data[0..q], table), dns.error_bad_edns());
+        // An OPT in the answer section.
+        var r = put_header(data, 1, 0, 1, 1, 0, 0);
+        r = put_example(data, r);
+        r = put16(data, r, 1);
+        r = put16(data, r, 1);
+        r = put8(data, r, 0);
+        r = put16(data, r, 41);
+        r = put16(data, r, 1232);
+        r = put32(data, r, 0);
+        r = put16(data, r, 0);
+        test.assert_eq(dns.parse(data[0..r], table), dns.error_bad_edns());
+        // Two OPTs in the additional section.
+        var t = put_header(data, 1, 0, 1, 0, 0, 2);
+        t = put_example(data, t);
+        t = put16(data, t, 1);
+        t = put16(data, t, 1);
+        var k = 0;
+        while k < 2 {
+            t = put8(data, t, 0);
+            t = put16(data, t, 41);
+            t = put16(data, t, 1232);
+            t = put32(data, t, 0);
+            t = put16(data, t, 0);
+            k = k + 1;
+        }
+        test.assert_eq(dns.parse(data[0..t], table), dns.error_bad_edns());
+    }
+    return 0;
+}
+
+// DNS folds the 26 ASCII letters and nothing else (RFC 4343): the characters either side of each range are not letters.
+fn test_case_folding_is_exactly_the_ascii_letters() -> [] int {
+    test.assert_eq(dns.fold('A'), 'a');
+    test.assert_eq(dns.fold('Z'), 'z');
+    test.assert_eq(dns.fold('a'), 'a');
+    test.assert_eq(dns.fold('z'), 'z');
+    test.assert_eq(dns.fold(64), 64);
+    test.assert_eq(dns.fold(91), 91);
+    test.assert_eq(dns.fold(96), 96);
+    test.assert_eq(dns.fold(123), 123);
+    test.assert_eq(dns.fold(0), 0);
+    test.assert_eq(dns.fold(255), 255);
     return 0;
 }
