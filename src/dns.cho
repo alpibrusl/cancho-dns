@@ -153,11 +153,11 @@ pub fn type_opt() -> [] int {
     return 41;
 }
 
-fn u16_at[&d](data: &d [byte], at: int) -> [] int {
+pub fn u16_at[&d](data: &d [byte], at: int) -> [] int {
     return int_of(data[at]) * 256 + int_of(data[at + 1]);
 }
 
-fn u32_at[&d](data: &d [byte], at: int) -> [] int {
+pub fn u32_at[&d](data: &d [byte], at: int) -> [] int {
     return u16_at(data, at) * 65536 + u16_at(data, at + 2);
 }
 

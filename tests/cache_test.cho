@@ -1,0 +1,471 @@
+import std.test;
+import dns;
+import stub;
+import cache;
+
+// The cache (`src/cache.cho`) against the codec and the stub: what a hit looks like, how TTLs run and end, what a negative
+// answer keeps, what is dropped from an upstream reply, what is not cached at all, and that a flood of names stays inside the
+// store. `docs/design.md` section 14 (gate 3, part 1) is the list this file answers.
+
+fn put_label[&b, &s](buf: &!b [byte], at: int, s: &s [byte]) -> [] int {
+    var p = dns.put8(buf, at, len(s));
+    var i = 0;
+    while i < len(s) {
+        p = dns.put8(buf, p, int_of(s[i]));
+        i = i + 1;
+    }
+    return p;
+}
+
+// A query for `<first>.example` of type `qtype`, with an OPT record if `udp_size` is not 0. Answers its length.
+fn make_query[&b, &s](buf: &!b [byte], first: &s [byte], qtype: int, udp_size: int) -> [] int {
+    var additional = 0;
+    if udp_size > 0 {
+        additional = 1;
+    }
+    var p = dns.put16(buf, 0, 4660);
+    p = dns.put16(buf, p, 256);
+    p = dns.put16(buf, p, 1);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, additional);
+    p = put_label(buf, p, first);
+    p = put_label(buf, p, "example");
+    p = dns.put8(buf, p, 0);
+    p = dns.put16(buf, p, qtype);
+    p = dns.put16(buf, p, 1);
+    if udp_size > 0 {
+        p = dns.put_opt(buf, p, udp_size, 0);
+    }
+    return p;
+}
+
+// Ask the cache about `<first>.example`; a miss is answered by the stub and stored. Answers what `cache.lookup` answered
+// the first time (0 for a miss), and leaves the reply, if there was one, in `out`, parsed into `rt`.
+fn ask[&c, &a, &o, &r](c: &!c cache.Cache, now: int, first: &a [byte], qtype: int, udp_size: int, limit: int, out: &!o [byte], rt: &!r [int]) -> [] int {
+    var answer = 0;
+    region g {
+        let table = alloc_slice[g](dns.slots(), 0);
+        let data = alloc_slice[g](512, byte_of(0));
+        let upstream = alloc_slice[g](stub.largest(), byte_of(0));
+        let utable = alloc_slice[g](dns.slots(), 0);
+        let size = make_query(data, first, qtype, udp_size);
+        test.assert_eq(dns.parse(data[0..size], table), size);
+        answer = cache.lookup(c, now, data[0..size], table, out, limit);
+        if answer == 0 {
+            let used = stub.respond(upstream, data[0..size], table, 0);
+            test.assert(used > 0);
+            test.assert_eq(dns.parse(upstream[0..used], utable), used);
+            cache.insert(c, now, data[0..size], table, upstream[0..used], utable);
+            answer = cache.reread(c, now, data[0..size], table, out, limit);
+            // The first answer was a miss: tell the caller so.
+            test.assert(answer > 0);
+            dns.parse(out[0..answer], rt);
+            answer = 0 - answer;
+        } else {
+            dns.parse(out[0..answer], rt);
+        }
+    }
+    return answer;
+}
+
+// The TTL of record `i` of the parsed reply.
+fn ttl_of[&t](table: &t [int], i: int) -> [] int {
+    return table[14 + 6 * i + 3];
+}
+
+fn test_a_hit_has_the_clients_id_and_its_ttls_run_down[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            // First ask: a miss that is then stored; the entry, as served straight away, has the whole TTL.
+            test.assert(ask(w, 1000000, "ttl30", 1, 0, 0, out, rt) < 0);
+            test.assert_eq(rt[3], 1);
+            test.assert_eq(ttl_of(rt, 0), 30);
+            test.assert_eq(rt[0], 4660);
+            test.assert_eq(rt[1], 32768 + 256 + 128);
+            // Five seconds on: 25. A different microsecond of the same second changes nothing.
+            test.assert(ask(w, 1005000, "ttl30", 1, 0, 0, out, rt) > 0);
+            test.assert_eq(ttl_of(rt, 0), 25);
+            test.assert(ask(w, 1005999, "ttl30", 1, 0, 0, out, rt) > 0);
+            test.assert_eq(ttl_of(rt, 0), 25);
+            // 29 seconds: 1 left. At 30 the entry is gone and the next ask goes upstream again.
+            test.assert(ask(w, 1029000, "ttl30", 1, 0, 0, out, rt) > 0);
+            test.assert_eq(ttl_of(rt, 0), 1);
+            test.assert(ask(w, 1030000, "ttl30", 1, 0, 0, out, rt) < 0);
+            test.assert_eq(cache.hits(w), 3);
+            test.assert_eq(cache.misses(w), 2);
+            test.assert_eq(cache.stored(w), 2);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_ttls_are_clamped_to_the_floor_and_the_ceiling[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            // 2 seconds becomes 10; 99,999,999 becomes a day.
+            ask(w, 0, "ttl2", 1, 0, 0, out, rt);
+            test.assert_eq(ttl_of(rt, 0), 10);
+            ask(w, 9000, "ttl2", 1, 0, 0, out, rt);
+            test.assert_eq(ttl_of(rt, 0), 1);
+            ask(w, 0, "ttl99999999", 1, 0, 0, out, rt);
+            test.assert_eq(ttl_of(rt, 0), 86400);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_the_smallest_ttl_of_a_set_ends_the_entry[&h](heap: &!h Heap) -> [heap] int {
+    // The stub gives every record of an answer one TTL, so the rule is tested at its edge: a 1-second floor and a 3-second TTL.
+    var c = cache.open(heap, 65536, 64, 0, 1);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            ask(w, 0, "ttl3", 1, 0, 0, out, rt);
+            test.assert(ask(w, 2999, "ttl3", 1, 0, 0, out, rt) > 0);
+            test.assert(ask(w, 3000, "ttl3", 1, 0, 0, out, rt) < 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_a_negative_answer_is_kept_for_its_soa_and_served_with_it[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            test.assert(ask(w, 0, "nxdomain", 1, 0, 0, out, rt) < 0);
+            test.assert_eq(rt[1] % 16, 3);
+            test.assert_eq(rt[3], 0);
+            test.assert_eq(rt[4], 1);
+            test.assert_eq(rt[14 + 1], 6);
+            test.assert_eq(ttl_of(rt, 0), 30);
+            // Served again, with the SOA's TTL running down; gone after 30 seconds.
+            test.assert(ask(w, 12000, "nxdomain", 1, 0, 0, out, rt) > 0);
+            test.assert_eq(rt[1] % 16, 3);
+            test.assert_eq(ttl_of(rt, 0), 18);
+            test.assert(ask(w, 30000, "nxdomain", 1, 0, 0, out, rt) < 0);
+            // The same name for another type is another question: not answered by the first.
+            test.assert(ask(w, 30000, "nxdomain", 28, 0, 0, out, rt) < 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_names_that_differ_only_in_case_share_an_entry_and_the_client_sees_its_own[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            ask(w, 0, "www", 1, 0, 0, out, rt);
+            test.assert(ask(w, 1000, "WwW", 1, 0, 0, out, rt) > 0);
+            // The question in the reply is the client's: `WwW`.
+            test.assert_eq(int_of(out[13]), 'W');
+            test.assert_eq(int_of(out[14]), 'w');
+            test.assert_eq(cache.hits(w), 1);
+            test.assert_eq(cache.stored(w), 1);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_a_client_with_edns_gets_an_opt_and_a_big_reply_is_cut_to_tc[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 262144, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            ask(w, 0, "n40", 1, 4096, 0, out, rt);
+            test.assert_eq(rt[9], 40);
+            // 40 records, uncompressed, are over 512: with a 512 limit a hit is the TC form, question and OPT only.
+            let cut = ask(w, 1000, "n40", 1, 1232, 512, out, rt);
+            test.assert(cut > 0);
+            test.assert_eq(rt[1] / 512 % 2, 1);
+            test.assert_eq(rt[3], 0);
+            test.assert(rt[9] >= 0);
+            // Without a limit the same entry is whole again, with every address.
+            test.assert(ask(w, 1000, "n40", 1, 0, 0, out, rt) > 0);
+            test.assert_eq(rt[3], 40);
+            test.assert_eq(rt[9], 0 - 1);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// What is kept of an upstream reply
+// ---------------------------------------------------------------------
+
+fn put_name[&b](buf: &!b [byte], at: int, first: int, second: int) -> [] int {
+    // `<w><w>.example`: a one-letter label, `second` as a one-letter label, and `example`.
+    var p = dns.put8(buf, at, 1);
+    p = dns.put8(buf, p, first);
+    p = put_label(buf, p, "example");
+    p = dns.put8(buf, p, 0);
+    return p;
+}
+
+fn put_a[&b](buf: &!b [byte], at: int, owner: int, ttl: int, last: int) -> [] int {
+    var p = put_name(buf, at, owner, 0);
+    p = dns.put16(buf, p, 1);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 4);
+    p = dns.put8(buf, p, 192);
+    p = dns.put8(buf, p, 0);
+    p = dns.put8(buf, p, 2);
+    return dns.put8(buf, p, last);
+}
+
+// The query `a.example` A, and a reply to it with the given rcode, the question as given, and `answers` of the records
+// `build` writes. Used by the tests below, which each lay out their own records.
+fn query_a[&b](buf: &!b [byte]) -> [] int {
+    var p = dns.put16(buf, 0, 4660);
+    p = dns.put16(buf, p, 256);
+    p = dns.put16(buf, p, 1);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = put_name(buf, p, 'a', 0);
+    p = dns.put16(buf, p, 1);
+    return dns.put16(buf, p, 1);
+}
+
+fn reply_head[&b](buf: &!b [byte], flags: int, an: int, ns: int, ar: int, qname: int) -> [] int {
+    var p = dns.put16(buf, 0, 4660);
+    p = dns.put16(buf, p, flags);
+    p = dns.put16(buf, p, 1);
+    p = dns.put16(buf, p, an);
+    p = dns.put16(buf, p, ns);
+    p = dns.put16(buf, p, ar);
+    p = put_name(buf, p, qname, 0);
+    p = dns.put16(buf, p, 1);
+    return dns.put16(buf, p, 1);
+}
+
+fn put_txt[&b](buf: &!b [byte], at: int, owner: int, ttl: int) -> [] int {
+    var p = put_name(buf, at, owner, 0);
+    p = dns.put16(buf, p, 16);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 2);
+    p = dns.put8(buf, p, 1);
+    return dns.put8(buf, p, 'x');
+}
+
+fn put_cname[&b](buf: &!b [byte], at: int, owner: int, target: int, ttl: int) -> [] int {
+    var p = put_name(buf, at, owner, 0);
+    p = dns.put16(buf, p, 5);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 11);
+    return put_name(buf, p, target, 0);
+}
+
+fn test_only_the_answer_chain_is_kept[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let q = alloc_slice[g](512, byte_of(0));
+            let r = alloc_slice[g](2048, byte_of(0));
+            let out = alloc_slice[g](4096, byte_of(0));
+            let qt = alloc_slice[g](dns.slots(), 0);
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let ot = alloc_slice[g](dns.slots(), 0);
+            let qn = query_a(q);
+            test.assert_eq(dns.parse(q[0..qn], qt), qn);
+            // a.example A. Records: an A for b before the CNAME that makes b the name (dropped: out of order), a CNAME a -> b, an A for b
+            // (kept), an A for w (planted: dropped); and an A for x in the additional section (dropped).
+            var p = reply_head(r, 33152, 5, 0, 1, 'a');
+            p = put_a(r, p, 'b', 300, 9);
+            p = put_cname(r, p, 'a', 'b', 100);
+            p = put_a(r, p, 'b', 300, 8);
+            p = put_txt(r, p, 'b', 300);
+            p = put_a(r, p, 'w', 300, 6);
+            p = put_a(r, p, 'x', 300, 7);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 0);
+            let n = cache.lookup(w, 1000, q[0..qn], qt, out, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], ot), n);
+            test.assert_eq(ot[3], 2);
+            test.assert_eq(ot[5], 0);
+            test.assert_eq(ot[14 + 1], 5);
+            test.assert_eq(ot[14 + 6 + 1], 1);
+            // The A that is kept is the one for b: its last byte is 8 (the planted ones were 9, 6 and 7).
+            test.assert_eq(int_of(out[ot[14 + 6 + 4] + 3]), 8);
+            // The entry lives for the smaller of the kept TTLs (the CNAME's 100, not the A's 300): at 100 seconds it is gone; at 1 second the
+            // TTLs seen are 99 and 299.
+            test.assert_eq(ot[14 + 3], 99);
+            test.assert_eq(ot[14 + 6 + 3], 299);
+            test.assert(cache.lookup(w, 100000, q[0..qn], qt, out, 0) == 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn put_soa[&b](buf: &!b [byte], at: int, ttl: int, minimum: int) -> [] int {
+    var p = put_name(buf, at, 'z', 0);
+    p = dns.put16(buf, p, 6);
+    p = dns.put16(buf, p, 1);
+    p = dns.put32(buf, p, ttl);
+    p = dns.put16(buf, p, 42);
+    p = put_name(buf, p, 'm', 0);
+    p = put_name(buf, p, 'r', 0);
+    p = dns.put32(buf, p, 1);
+    p = dns.put32(buf, p, 2);
+    p = dns.put32(buf, p, 3);
+    p = dns.put32(buf, p, 4);
+    return dns.put32(buf, p, minimum);
+}
+
+fn test_a_negative_answer_lives_for_the_smaller_of_the_soas_ttl_and_minimum[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let q = alloc_slice[g](512, byte_of(0));
+            let r = alloc_slice[g](2048, byte_of(0));
+            let out = alloc_slice[g](4096, byte_of(0));
+            let qt = alloc_slice[g](dns.slots(), 0);
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let qn = query_a(q);
+            test.assert_eq(dns.parse(q[0..qn], qt), qn);
+            // NXDOMAIN, SOA TTL 300, MINIMUM 20: it lasts 20 seconds, and the SOA is served with 20 (not 300) on it.
+            var p = reply_head(r, 33152 + 3, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 20);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 0);
+            let n = cache.lookup(w, 5000, q[0..qn], qt, out, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], rt), n);
+            test.assert_eq(rt[14 + 3], 15);
+            test.assert(cache.lookup(w, 19999, q[0..qn], qt, out, 0) > 0);
+            test.assert(cache.lookup(w, 20000, q[0..qn], qt, out, 0) == 0);
+            // And a MINIMUM under the floor is raised to it: 10 seconds.
+            p = reply_head(r, 33152 + 3, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 2);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 100000, q[0..qn], qt, r[0..p], rt), 0);
+            test.assert(cache.lookup(w, 109999, q[0..qn], qt, out, 0) > 0);
+            test.assert(cache.lookup(w, 110000, q[0..qn], qt, out, 0) == 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_a_reply_that_is_not_for_the_question_or_not_an_answer_is_not_cached[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let q = alloc_slice[g](512, byte_of(0));
+            let r = alloc_slice[g](2048, byte_of(0));
+            let qt = alloc_slice[g](dns.slots(), 0);
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let qn = query_a(q);
+            test.assert_eq(dns.parse(q[0..qn], qt), qn);
+            // A reply to another question (`b.example`).
+            var p = reply_head(r, 33152, 1, 0, 0, 'b');
+            p = put_a(r, p, 'b', 300, 1);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            // A reply whose question is the same name but another type (AAAA).
+            p = reply_head(r, 33152, 0, 1, 0, 'a');
+            p = put_soa(r, p, 300, 300);
+            dns.put16(r, 12 + 11, 28);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            // Truncated (TC), REFUSED, and NXDOMAIN with no SOA are not cached either.
+            p = reply_head(r, 33152 + 512, 1, 0, 0, 'a');
+            p = put_a(r, p, 'a', 300, 1);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            p = reply_head(r, 33152 + 5, 0, 0, 0, 'a');
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            p = reply_head(r, 33152 + 3, 0, 0, 0, 'a');
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 1);
+            test.assert_eq(cache.stored(w), 0);
+            test.assert_eq(cache.uncacheable(w), 5);
+            // SERVFAIL is kept, for five seconds.
+            p = reply_head(r, 33152 + 2, 0, 0, 0, 'a');
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 0);
+            let out = alloc_slice[g](512, byte_of(0));
+            test.assert(cache.lookup(w, 4999, q[0..qn], qt, out, 0) > 0);
+            test.assert_eq(int_of(out[3]) % 16, 2);
+            test.assert(cache.lookup(w, 5000, q[0..qn], qt, out, 0) == 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------
+
+fn name_for[&b](buf: &!b [byte], n: int) -> [] int {
+    buf[0] = byte_of('h');
+    var digits = 1;
+    var rest = n / 10;
+    while rest > 0 {
+        digits = digits + 1;
+        rest = rest / 10;
+    }
+    var value = n;
+    var i = digits;
+    while i > 0 {
+        buf[i] = byte_of('0' + value % 10);
+        value = value / 10;
+        i = i - 1;
+    }
+    return digits + 1;
+}
+
+fn test_ten_thousand_names_in_a_small_store_never_leave_it[&h](heap: &!h Heap) -> [heap] int {
+    var c = cache.open(heap, 32768, 100, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let out = alloc_slice[g](8192, byte_of(0));
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let name = alloc_slice[g](16, byte_of(0));
+            var i = 0;
+            var most = 0;
+            while i < 10000 {
+                let n = name_for(name, i);
+                ask(w, i * 10, name[0..n], 1, 0, 0, out, rt);
+                if cache.live(w) > most {
+                    most = cache.live(w);
+                }
+                test.assert(cache.used(w) <= cache.capacity(w));
+                i = i + 1;
+            }
+            test.assert(most <= 100);
+            test.assert(cache.evicted(w) > 0);
+            test.assert_eq(cache.no_room(w), 0);
+            // The newest name is still there.
+            let n = name_for(name, 9999);
+            test.assert(ask(w, 100000, name[0..n], 1, 0, 0, out, rt) > 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}

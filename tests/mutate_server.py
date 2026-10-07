@@ -23,7 +23,7 @@ for path, old, new, why in MUTANTS:
         f = os.path.join(d, path); text = open(f).read()
         assert text.count(old) >= 1, (path, old)
         open(f, "w").write(text.replace(old, new, 1))
-        b = subprocess.run([cancho, "build", "--std", "src/server.cho", "src/dns.cho", "src/stub.cho", "-o", "server"],
+        b = subprocess.run([cancho, "build", "--std", "src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "-o", "server"],
                            cwd=d, capture_output=True, text=True)
         if b.returncode != 0:
             print("BUILD FAILED (mutant invalid):", why, b.stderr[-200:]); sys.exit(1)

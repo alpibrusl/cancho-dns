@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), and D1, the UDP and TCP server (section 13), are built; the cache, forwarder and benchmark are not.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), are built; the forwarder and the benchmark are not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -255,7 +255,7 @@ report is unbounded, and CI runs it once with a ceiling that must be refused so 
 * The encoder (`encode_query`, `encode_error`) is tested by parsing what it writes with this codec, **not yet by dnspython**.
 * Record types whose data holds names beyond the ones the codec checks (NSEC, RRSIG's signer, KX, RP, and others) are opaque to it, as unknown types are.
 * The differential has been run on the debug compiler only; the pinned release build runs it in CI.
-* There is no cache and no benchmark: the baseline table of section 8 is still empty (the server is section 13).
+* There is no benchmark: the baseline table of section 8 is still empty (the server is section 13, the cache section 14).
 
 ## 13. D1, built and measured: the UDP and TCP server
 
@@ -282,6 +282,79 @@ Not done in D1, said so.
 * No load measurement and no comparison with another server: the baseline table of section 8 is still empty.
 * No upstream, cache or source-port randomisation (D2 to D4).
 * The server is tested on loopback only, and the differential test of the encoder against dnspython is still open from D0.
+
+## 14. D2, the cache: design and gate, written before the code
+
+*Status: built (section 14.1). Corrected in place if a claim below turns out false.*
+
+**Reuse.** `src/store.cho` is cancho-cache's store (the arena, the open-addressing index with backward-shift deletion, sampled LRU, lazy expiry plus a bounded
+sweep, incremental compaction), **vendored at cancho-cache `e196d5a` and not edited** (it is not a library yet; a vendored file with its origin in the
+header is the honest form until it is). Nothing is allocated after `open`, which is what gate 3 needs.
+
+**Key and value.** Key: the question name in lower-case wire form (RFC 4343 folding), then type and class, 2 bytes each. Value: the *answer chain* of
+section 6 in a position-independent form: a 4-byte header (rcode, answer count, authority count, flags), the stored-at time, and for each record its
+owner name, type, class, original TTL and rdata **with embedded names expanded** (no compression pointers, so a record can be written at any offset of a
+later reply). Types whose rdata holds names are re-encoded for CNAME, NS, PTR, DNAME, MX, SRV and SOA; a record of any other type is stored opaque. A reply that
+the re-encoder cannot fit is not cached (`uncacheable` is counted), never cached wrongly.
+
+**What is kept** (section 6, now exact): starting at the question name, an answer record is kept if its owner equals the current name and it is a CNAME (the
+current name becomes its target) or of the question's type; nothing else of the answer section, nothing of the additional section. A negative answer
+(NXDOMAIN, or NOERROR with nothing kept) keeps the SOA of the authority section and caches for `min(SOA TTL, SOA MINIMUM)` (RFC 2308), clamped to
+[10 s, 1 hour]; positive TTLs are clamped to [10 s, 1 day] and the entry lives for the smallest kept TTL. `SERVFAIL` is stored for 5 s. Only `NOERROR`,
+`NXDOMAIN` and `SERVFAIL` are cached; a reply with TC set is never cached.
+
+**On a hit** the reply is built from the entry and the query: the query's ID, its question as sent (its case), `QR RD RA`, each TTL reduced by the
+seconds since it was stored (never below the clamp's floor reached at 0 remaining: an entry is gone when its smallest TTL is, so no TTL is written as 0
+from a live entry except where the original was 0), and the OPT record of the client's EDNS if it sent one. The existing truncation applies to it.
+
+**Until D3 the "upstream" is the stub**: a miss is answered by `stub.respond` and the reply goes through the same insertion code a forwarded reply will, so what
+is exercised is the cache, not a stand-in for it. `n<k>.` and `t<k>.` are as in section 13; `ttl<k>.` gives one A record with TTL k, `nx` names give
+NXDOMAIN with an SOA (TTL and MINIMUM 30). A CHAOS-class TXT query for `stats.bind.` returns the counters (hits, misses, stored, evicted, expired,
+uncacheable, live, used bytes), so tests can see the cache from outside.
+
+**Gate 3, fixed before the code.** *(Corrected in place, see 14.1: item 3 first said "the first 10,000 and the last differ by under 5%".)*
+1. *Unit* (`tests/cache_test.cho`): TTLs are clamped and decremented; the smallest kept TTL ends the entry; negative caching uses SOA `MINIMUM` and the clamp;
+   a CNAME chain is kept and a record planted outside it is dropped; a reply with TC, an unsupported rcode or an unfitting record is not cached; names
+   differing only in case share an entry; an entry over its time is a miss; filling a small store with 10,000 distinct names never exceeds `max_keys` or the
+   arena and evicts.
+2. *Black-box, through the server* (`tests/cache_server_test.py`, dnspython): a repeated query is a hit (counters) and its TTL falls; with the clamp floor
+   set to 1 s at start a 1-second record is a miss again after 2 s; an NXDOMAIN is served from cache; a hot name survives a flood.
+3. *Memory bounded*: 100,000 distinct names through a server with a 1 MiB arena; `VmRSS` after the first 80,000 and after the last differ by under 1%,
+   `evicted` is over 0, `live` never exceeds the key cap, and a name queried again every 100 queries throughout still hits. This runs in CI.
+4. *The gate can fail*: mutants of the cache (TTL not decremented, clamp floor removed, SOA ignored for negatives, chain filter off, case-sensitive key,
+   no eviction) are each killed by the tests above; any survivor is listed here with the reason.
+
+Cell A (UDP cache hit, 50 clients) and cell D (memory after 100,000 distinct names) are *recorded* in D2 against `dnsperf` if it can be installed in CI,
+and reported plainly whichever way they point; if not, the cell is reported as not measured, with the reason. No ratio is claimed from this step.
+
+### 14.1 Built and measured
+
+`src/cache.cho` over the vendored `src/store.cho`; `server` takes `<port> [<idle s> [<min ttl s> [<cache bytes> [<cache keys>]]]]` (10, 10, 16 MiB, 65,536). The
+`stats.bind. CH TXT` query returns the counters. Seed of the store's hash is the constant 0 until D3 reads one at start (a client that can choose names could
+aim collisions at the index; D3 closes that, and until then it is a known weakness).
+
+* *Gate 3, part 1* (`tests/cache_test.cho`, 10 tests): TTL decrement and expiry to the second; floor and ceiling; the smallest kept TTL ends the entry; SOA
+  `MINIMUM` and the clamp for negatives; the answer chain (out-of-order, off-chain, wrong-type, and additional records dropped); TC, REFUSED, a reply to
+  another name or another type, and an SOA-less NXDOMAIN not cached; SERVFAIL kept 5 s; case-insensitive keys with the client's own case echoed; EDNS and
+  the size limit on a hit; 10,000 names through a 100-key store.
+* *Part 2* (`tests/cache_server_test.py`, 6 behaviour tests through the server with dnspython): hit counters and TTL running down and ending, case, negative
+  answers from the cache, TCP served from the same cache, a cached big answer still truncated over UDP, refusals not cached.
+* *Part 3, memory*: 100,000 distinct names through a 1 MiB, 2,048-key store: 97,953 evicted, `live` held at 2,048, `used` under `capacity`, no refusals for lack
+  of room, a hot name asked every 100 names kept hitting (over 95% of its asks), and `VmRSS` 4,492 KiB after 80,000 names and 4,492 KiB after 100,000.
+  **Correction made in place:** the gate first said "after the first 10,000 names and after the last, within 5%". Measured, RSS climbs about 312 KiB per
+  10,000 names until 65,536 datagrams and is flat after, for any arena size (256 KiB, 1 MiB, 4 MiB all stop at the same name count). That is the UDP
+  runtime's ring of 65,536 peer tickets (`docs/udp.md`) being written for the first time, about 32 bytes each, **not the cache**: this is inferred from the
+  match with 65,536, not isolated by a run without the ring. The gate now reads RSS after that ring has been written round once.
+* *Part 4*: `tests/mutate_cache.py`, 16 mutants of `src/cache.cho` (decrement, floor, ceiling, chain filter, type filter, case fold, eviction, TC, smallest TTL, SOA
+  `MINIMUM`, SOA-less negative, size limit, id, question, question match, SERVFAIL TTL); **16 of 16 killed**. Two of them survived the first set of tests
+  (type filter, mismatched type) and the tests were strengthened, not the mutants dropped; the TC test was also made to carry an answer, as a TC reply without one was never cacheable anyway.
+* *Gate 6*: the server's authority ceiling is unchanged by the cache (same labels), diffed in CI.
+
+Not done in D2, said so.
+* **Cell A and cell D are not measured.** `dnsperf` was not run; no ratio is claimed. The only cache numbers here are the correctness and RSS ones above.
+* The "upstream" is the stub: no real answer has gone through `insert` yet, so the re-encoder is tested on constructed replies only (CNAME, A, TXT, SOA); NS, PTR,
+  MX, SRV and DNAME rdata go through the same code path but have no test of their own.
+* No negative-cache aggressive use, no prefetch, no serve-stale; entry size is capped at 4,096 bytes (a larger answer is not cached).
 
 ## Reproduce (section 2)
 
