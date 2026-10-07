@@ -32,7 +32,7 @@ pub fn udp_ceiling() -> [] int {
 
 // What the largest reply of this stub can be, so the buffer a caller gives it can be sized.
 pub fn largest() -> [] int {
-    return 2048;
+    return 8192;
 }
 
 // The most bytes a UDP reply to this parsed query may take.
@@ -69,6 +69,31 @@ fn count_in[&q](query: &q [byte], marker: int, at: int) -> [] int {
     return n;
 }
 
+// `ttl<digits>` at the start of the name: that many seconds for the A records, else 60.
+fn ttl_in[&q](query: &q [byte], at: int) -> [] int {
+    let size = int_of(query[at]);
+    if size < 4 || size > 14 || int_of(query[at + 1]) != 't' || int_of(query[at + 2]) != 't' || int_of(query[at + 3]) != 'l' {
+        return 60;
+    }
+    var n = 0;
+    var i = 4;
+    while i <= size {
+        let c = int_of(query[at + i]);
+        if c < '0' || c > '9' {
+            return 60;
+        }
+        n = n * 10 + (c - '0');
+        i = i + 1;
+    }
+    return n;
+}
+
+// Is the first label `nx` and anything after it? Those names do not exist: NXDOMAIN with an SOA (TTL and MINIMUM 30) in the
+// authority section.
+fn is_nx[&q](query: &q [byte], at: int) -> [] bool {
+    return int_of(query[at]) >= 2 && int_of(query[at + 1]) == 'n' && int_of(query[at + 2]) == 'x';
+}
+
 // The header of a reply to a parsed query: its id, QR, the query's recursion-desired bit, RA, `rcode`; `answers` records.
 fn put_header[&o, &t](out: &!o [byte], table: &t [int], truncated: bool, answers: int, additional: int) -> [] int {
     var flags = 32768 + table[1] / 256 % 2 * 256 + 128;
@@ -81,6 +106,76 @@ fn put_header[&o, &t](out: &!o [byte], table: &t [int], truncated: bool, answers
     p = dns.put16(out, p, answers);
     p = dns.put16(out, p, 0);
     return dns.put16(out, p, additional);
+}
+
+// NXDOMAIN for the name, with `ns.example.` `hostmaster.example.` as the SOA of `example.`, every number 30.
+fn respond_nx[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [int], question_end: int) -> [] int {
+    // owner (pointer to "example." inside the question name is not assumed: it is written out), then the data.
+    let soa = 9 + 4 + 2 + 5 + 4 + 2 + 5 + 3 + 20;
+    var extra = 0;
+    if table[9] >= 0 {
+        extra = dns.opt_size();
+    }
+    if question_end + soa + extra + 16 > len(out) {
+        return dns.error_no_room();
+    }
+    var flags = 32768 + table[1] / 256 % 2 * 256 + 128 + 3;
+    var p = dns.put16(out, 0, table[0]);
+    p = dns.put16(out, p, flags);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 1);
+    var additional = 0;
+    if table[9] >= 0 {
+        additional = 1;
+    }
+    p = dns.put16(out, p, additional);
+    var i = dns.header_size();
+    while i < question_end {
+        out[i] = query[i];
+        i = i + 1;
+    }
+    p = question_end;
+    // Owner "example."
+    p = dns.put8(out, p, 7);
+    p = put_text(out, p, "example");
+    p = dns.put8(out, p, 0);
+    p = dns.put16(out, p, 6);
+    p = dns.put16(out, p, 1);
+    p = dns.put32(out, p, 30);
+    // Data: "ns" "example" 0, "hostmaster" "example" 0 are written compactly as two names, then five numbers.
+    let start = p;
+    p = dns.put16(out, p, 0);
+    p = dns.put8(out, p, 2);
+    p = put_text(out, p, "ns");
+    p = dns.put8(out, p, 7);
+    p = put_text(out, p, "example");
+    p = dns.put8(out, p, 0);
+    p = dns.put8(out, p, 10);
+    p = put_text(out, p, "hostmaster");
+    p = dns.put8(out, p, 7);
+    p = put_text(out, p, "example");
+    p = dns.put8(out, p, 0);
+    p = dns.put32(out, p, 1);
+    p = dns.put32(out, p, 30);
+    p = dns.put32(out, p, 30);
+    p = dns.put32(out, p, 30);
+    p = dns.put32(out, p, 30);
+    dns.put16(out, start, p - start - 2);
+    if table[9] >= 0 {
+        p = dns.put_opt(out, p, udp_ceiling(), 0);
+    }
+    return p;
+}
+
+fn put_text[&o, &s](out: &!o [byte], at: int, s: &s [byte]) -> [] int {
+    var p = at;
+    var i = 0;
+    while i < len(s) {
+        p = dns.put8(out, p, int_of(s[i]));
+        i = i + 1;
+    }
+    return p;
 }
 
 // Answer the (parsed) `query` into `out`, held to `limit` bytes if that is not 0. Answers the length, or `dns.error_no_room()`.
@@ -120,6 +215,10 @@ pub fn respond[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [int], l
             strings = (data + 254) / 255;
         }
     }
+    if is_nx(query, dns.header_size()) {
+        return respond_nx(out, query, table, question_end);
+    }
+    let ttl = ttl_in(query, dns.header_size());
     var additional = 0;
     var opt_bytes = 0;
     if table[9] >= 0 {
@@ -162,7 +261,7 @@ pub fn respond[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [int], l
         if table[7] == 1 {
             p = dns.put16(out, p, 1);
             p = dns.put16(out, p, 1);
-            p = dns.put32(out, p, 60);
+            p = dns.put32(out, p, ttl);
             p = dns.put16(out, p, 4);
             p = dns.put8(out, p, 192);
             p = dns.put8(out, p, 0);

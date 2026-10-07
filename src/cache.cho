@@ -1,0 +1,449 @@
+edition 5;
+
+module cache;
+
+import dns;
+import store;
+
+// `cache` -- the resolver's answer cache (`docs/design.md` sections 6 and 14), on cancho-cache's `store` (vendored, not edited).
+//
+// A key is the question: the name in lower-case wire form, then type and class. A value is eight bytes (when it was stored, in
+// milliseconds) and then **the answer chain as a complete DNS message** with id 0, QR and RA set, the question once, the kept
+// records with no compression, and no OPT record: position-independent, so a hit is a copy with the id, the case of the
+// question, the recursion-desired bit and the TTLs patched, and an OPT record added if the client had one.
+//
+// What is kept of an upstream reply is exactly the section 6 rule: from the question name, a CNAME whose owner is the current name
+// (the current name becomes its target) or a record of the question's type with the current name as owner, in the order they come,
+// class IN only; nothing else of the answer section and none of the additional section. A negative answer keeps the SOA of the
+// authority section. Nothing is allocated after `open`.
+
+// The most bytes of one entry's message; a reply that needs more is not cached.
+pub fn entry_max() -> [] int {
+    return 4096;
+}
+
+fn prefix() -> [] int {
+    return 8;
+}
+
+fn key_max() -> [] int {
+    return 260;
+}
+
+pub res struct Cache {
+    store: store.Store,
+    // The key being looked up or stored.
+    key: Box[[byte]],
+    // The entry being built.
+    value: Box[[byte]],
+    // The current name of the chain, and the owner being compared with it.
+    cur: Box[[byte]],
+    tmp: Box[[byte]],
+    // 0 smallest positive TTL, 1 largest, 2 smallest negative, 3 largest negative, 4 the SERVFAIL TTL (seconds).
+    limits: Box[[int]],
+    // 0 hits, 1 misses, 2 stored, 3 not cacheable, 4 refused for lack of room.
+    counts: Box[[int]],
+}
+
+// A cache of `memory` arena bytes and `max_keys` keys. `min_ttl` is the floor of both clamps (10 seconds in production; the tests
+// lower it so that an expiry can be seen).
+pub fn open[&h](heap: &!h Heap, memory: int, max_keys: int, seed: int, min_ttl: int) -> [heap] Cache {
+    var limits = box_slice(heap, 5, 0);
+    borrow mut limits as &!lb in {
+        let l = contents(lb);
+        l[0] = min_ttl;
+        l[1] = 86400;
+        l[2] = min_ttl;
+        l[3] = 3600;
+        l[4] = 5;
+    }
+    return Cache { store: store.open(heap, memory, max_keys, seed, store.evict_lru()), key: box_slice(heap, key_max(), byte_of(0)), value: box_slice(heap, prefix() + entry_max(), byte_of(0)), cur: box_slice(heap, 256, byte_of(0)), tmp: box_slice(heap, 256, byte_of(0)), limits: limits, counts: box_slice(heap, 5, 0) };
+}
+
+pub fn close[&h](heap: &!h Heap, c: Cache) -> [heap] int {
+    let Cache { store, key, value, cur, tmp, limits, counts } = c;
+    unbox_slice(heap, key);
+    unbox_slice(heap, value);
+    unbox_slice(heap, cur);
+    unbox_slice(heap, tmp);
+    unbox_slice(heap, limits);
+    unbox_slice(heap, counts);
+    return store.close(heap, store);
+}
+
+pub fn hits[&c](cache: &c Cache) -> [] int {
+    return contents(cache.counts)[0];
+}
+
+pub fn misses[&c](cache: &c Cache) -> [] int {
+    return contents(cache.counts)[1];
+}
+
+pub fn stored[&c](cache: &c Cache) -> [] int {
+    return contents(cache.counts)[2];
+}
+
+pub fn uncacheable[&c](cache: &c Cache) -> [] int {
+    return contents(cache.counts)[3];
+}
+
+pub fn no_room[&c](cache: &c Cache) -> [] int {
+    return contents(cache.counts)[4];
+}
+
+pub fn live[&c](cache: &c Cache) -> [] int {
+    return store.live(cache.store);
+}
+
+pub fn used[&c](cache: &c Cache) -> [] int {
+    return store.used(cache.store);
+}
+
+pub fn capacity[&c](cache: &c Cache) -> [] int {
+    return store.capacity(cache.store);
+}
+
+pub fn evicted[&c](cache: &c Cache) -> [] int {
+    return store.evicted(cache.store);
+}
+
+pub fn expired[&c](cache: &c Cache) -> [] int {
+    return store.expired(cache.store);
+}
+
+// The loop's turn: say what time it is (milliseconds) and let the store do a slice of its housekeeping.
+pub fn tick[&c](cache: &!c Cache, now: int) -> [] int {
+    store.tick(cache.store, now);
+    return store.sweep(cache.store, 16);
+}
+
+fn bump[&c](cache: &!c Cache, which: int) -> [] int {
+    let counts = contents(cache.counts);
+    counts[which] = counts[which] + 1;
+    return 0;
+}
+
+fn clamp(ttl: int, lo: int, hi: int) -> [] int {
+    if ttl < lo {
+        return lo;
+    }
+    if ttl > hi {
+        return hi;
+    }
+    return ttl;
+}
+
+fn smaller(a: int, b: int) -> [] int {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+// The key of a question: its name (a query's first name is never compressed) folded to lower case, then type and class.
+// Answers its length, or -1.
+fn make_key[&c, &q](cache: &!c Cache, query: &q [byte], qtype: int, qclass: int) -> [] int {
+    let key = contents(cache.key);
+    let n = dns.name_expand(query, dns.header_size(), key[0..256]);
+    if n < 0 {
+        return 0 - 1;
+    }
+    var i = 0;
+    while i < n {
+        key[i] = byte_of(dns.fold(int_of(key[i])));
+        i = i + 1;
+    }
+    var p = dns.put16(key, n, qtype);
+    p = dns.put16(key, p, qclass);
+    return p;
+}
+
+fn put64[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    dns.put32(out, at, v / 4294967296);
+    return dns.put32(out, at + 4, v % 4294967296);
+}
+
+fn get64[&d](data: &d [byte], at: int) -> [] int {
+    return dns.u32_at(data, at) * 4294967296 + dns.u32_at(data, at + 4);
+}
+
+// ---------------------------------------------------------------------
+// A hit
+// ---------------------------------------------------------------------
+
+// Answer `query` (parsed into `table`) from the cache into `out`: the reply's length, or 0 if the cache has no live entry for it
+// or the entry would not fit `out`. A reply over `limit` bytes (0 for no limit) is the truncated form: header with TC, question,
+// OPT, no records.
+pub fn lookup[&c, &q, &t, &o](cache: &!c Cache, now: int, query: &q [byte], table: &t [int], out: &!o [byte], limit: int) -> [] int {
+    let klen = make_key(cache, query, table[7], table[8]);
+    if klen < 0 {
+        return 0;
+    }
+    let key = contents(cache.key)[0..klen];
+    store.tick(cache.store, now);
+    let e = store.find(cache.store, key, store.hash_of(cache.store, key));
+    if e < 0 {
+        bump(cache, 1);
+        return 0;
+    }
+    let entry = store.value(cache.store, e);
+    let msg = entry[prefix()..len(entry)];
+    let elapsed = (now - get64(entry, 0)) / 1000;
+    let question_end = dns.name_end(query, dns.header_size()) + 4;
+    var extra = 0;
+    if table[9] >= 0 {
+        extra = dns.opt_size();
+    }
+    if len(msg) + extra > len(out) {
+        return 0;
+    }
+    var i = 0;
+    while i < len(msg) {
+        out[i] = msg[i];
+        i = i + 1;
+    }
+    // The client's id, the client's question as sent (same length, perhaps another case), RD as asked, RA, the stored rcode.
+    dns.put16(out, 0, table[0]);
+    dns.put16(out, 2, 32768 + table[1] / 256 % 2 * 256 + 128 + int_of(msg[3]) % 16);
+    i = dns.header_size();
+    while i < question_end {
+        out[i] = query[i];
+        i = i + 1;
+    }
+    let records = dns.u16_at(msg, 6) + dns.u16_at(msg, 8);
+    var p = question_end;
+    var k = 0;
+    while k < records {
+        p = dns.name_end(out, p);
+        let ttl = dns.u32_at(out, p + 4);
+        dns.put32(out, p + 4, ttl - elapsed);
+        p = p + 10 + dns.u16_at(out, p + 8);
+        k = k + 1;
+    }
+    bump(cache, 0);
+    if limit > 0 && p + extra > limit {
+        // Too big for the client: TC, and nothing it would have to throw away.
+        dns.put16(out, 2, 32768 + table[1] / 256 % 2 * 256 + 128 + 512 + int_of(msg[3]) % 16);
+        dns.put16(out, 6, 0);
+        dns.put16(out, 8, 0);
+        p = question_end;
+    }
+    if table[9] >= 0 {
+        dns.put16(out, 10, 1);
+        p = dns.put_opt(out, p, 1232, 0);
+    }
+    return p;
+}
+
+// ---------------------------------------------------------------------
+// Storing a reply
+// ---------------------------------------------------------------------
+
+// Write the data of a record of type `rtype` (at `at`, `size` bytes, in `reply`) into `ent` at `p` with the names in it expanded.
+// Answers where it ends, or -1 if it does not fit.
+fn put_rdata[&r, &v](ent: &!v [byte], p: int, reply: &r [byte], rtype: int, at: int, size: int) -> [] int {
+    var q = p;
+    var from = at;
+    var names = 0;
+    var fixed = 0;
+    if rtype == 2 || rtype == 5 || rtype == 12 || rtype == 39 {
+        names = 1;
+    } else if rtype == 15 {
+        names = 1;
+        fixed = 2;
+    } else if rtype == 33 {
+        names = 1;
+        fixed = 6;
+    } else if rtype == 6 {
+        names = 2;
+    }
+    if names == 0 {
+        if q + size > len(ent) {
+            return 0 - 1;
+        }
+        var i = 0;
+        while i < size {
+            ent[q + i] = reply[from + i];
+            i = i + 1;
+        }
+        return q + size;
+    }
+    var i = 0;
+    while i < fixed {
+        ent[q + i] = reply[from + i];
+        i = i + 1;
+    }
+    q = q + fixed;
+    from = from + fixed;
+    var k = 0;
+    while k < names {
+        let n = dns.name_expand(reply, from, ent[q..len(ent)]);
+        if n < 0 {
+            return 0 - 1;
+        }
+        q = q + n;
+        from = dns.name_end(reply, from);
+        k = k + 1;
+    }
+    if rtype == 6 {
+        // Serial, refresh, retry, expire, minimum.
+        if q + 20 > len(ent) {
+            return 0 - 1;
+        }
+        i = 0;
+        while i < 20 {
+            ent[q + i] = reply[from + i];
+            i = i + 1;
+        }
+        q = q + 20;
+    }
+    return q;
+}
+
+// Append one record to `ent` at `p`: the owner as expanded in `owner`, type, class, `ttl`, and the data re-encoded. Answers where it
+// ends, or -1.
+fn put_record[&r, &v, &w](ent: &!v [byte], p: int, owner: &w [byte], reply: &r [byte], rtype: int, class: int, ttl: int, at: int, size: int) -> [] int {
+    // The longest this can be: the owner, 10 bytes, and the data with up to two expanded names.
+    if p + len(owner) + 10 + size + 512 > len(ent) {
+        return 0 - 1;
+    }
+    var q = p;
+    var i = 0;
+    while i < len(owner) {
+        ent[q + i] = owner[i];
+        i = i + 1;
+    }
+    q = q + len(owner);
+    q = dns.put16(ent, q, rtype);
+    q = dns.put16(ent, q, class);
+    q = dns.put32(ent, q, ttl);
+    let data = q + 2;
+    let end = put_rdata(ent, data, reply, rtype, at, size);
+    if end < 0 {
+        return 0 - 1;
+    }
+    dns.put16(ent, q, end - data);
+    return end;
+}
+
+// Store the reply `reply` (parsed into `rt`) to the query `query` (parsed into `qt`). 0: stored. 1: not cacheable (and not stored, so
+// the next ask goes upstream again). 2: no room in the store.
+pub fn insert[&c, &q, &t, &r, &u](cache: &!c Cache, now: int, query: &q [byte], qt: &t [int], reply: &r [byte], rt: &u [int]) -> [] int {
+    let lim = contents(cache.limits);
+    let flags = rt[1];
+    let rcode = flags % 16;
+    // A truncated reply is a prompt to ask again by TCP, not an answer; and only these three outcomes are kept.
+    if flags / 512 % 2 == 1 || rcode != 0 && rcode != 2 && rcode != 3 {
+        bump(cache, 3);
+        return 1;
+    }
+    let klen = make_key(cache, query, qt[7], qt[8]);
+    if klen < 0 || qt[8] != 1 {
+        bump(cache, 3);
+        return 1;
+    }
+    // The reply must repeat the question.
+    let ent = contents(cache.value);
+    let cur = contents(cache.cur);
+    let tmp = contents(cache.tmp);
+    if rt[7] != qt[7] || rt[8] != qt[8] {
+        bump(cache, 3);
+        return 1;
+    }
+    var p = prefix();
+    dns.put16(ent, p, 0);
+    dns.put16(ent, p + 2, 32768 + 128 + rcode);
+    dns.put16(ent, p + 4, 1);
+    dns.put16(ent, p + 6, 0);
+    dns.put16(ent, p + 8, 0);
+    dns.put16(ent, p + 10, 0);
+    p = p + dns.header_size();
+    let qn = dns.name_expand(reply, rt[6], ent[p..len(ent)]);
+    if qn < 0 {
+        bump(cache, 3);
+        return 1;
+    }
+    let same = dns.name_expand(query, dns.header_size(), cur);
+    if same < 0 || !dns.names_equal(cur[0..same], ent[p..p + qn]) {
+        bump(cache, 3);
+        return 1;
+    }
+    p = p + qn;
+    p = dns.put16(ent, p, rt[7]);
+    p = dns.put16(ent, p, rt[8]);
+    let answers = rt[3];
+    let authority = rt[4];
+    var kept = 0;
+    var life = lim[1];
+    var cn = same;
+    if rcode != 2 {
+        var i = 0;
+        while i < answers {
+            let b = 14 + 6 * i;
+            let n = dns.name_expand(reply, rt[b], tmp);
+            if n >= 0 && rt[b + 2] == 1 && dns.names_equal(cur[0..cn], tmp[0..n]) && (rt[b + 1] == 5 || rt[b + 1] == rt[7]) {
+                let ttl = clamp(rt[b + 3], lim[0], lim[1]);
+                let end = put_record(ent, p, tmp[0..n], reply, rt[b + 1], 1, ttl, rt[b + 4], rt[b + 5]);
+                if end < 0 {
+                    bump(cache, 3);
+                    return 1;
+                }
+                if rt[b + 1] == 5 {
+                    // The chain goes on from the target, as it was written into the entry.
+                    let target = dns.name_expand(ent, p + n + 10, cur);
+                    cn = target;
+                    if target < 0 {
+                        bump(cache, 3);
+                        return 1;
+                    }
+                }
+                p = end;
+                kept = kept + 1;
+                life = smaller(life, ttl);
+            }
+            i = i + 1;
+        }
+    }
+    var negative = 0;
+    if rcode == 2 {
+        life = lim[4];
+    } else if kept == 0 {
+        // A negative answer is cached for as long as its SOA says (RFC 2308), and without one it is not cached.
+        var i = answers;
+        var found = false;
+        while i < answers + authority && !found {
+            let b = 14 + 6 * i;
+            if rt[b + 1] == 6 && rt[b + 2] == 1 && rt[b + 5] >= 20 {
+                let n = dns.name_expand(reply, rt[b], tmp);
+                if n >= 0 {
+                    let minimum = dns.u32_at(reply, rt[b + 4] + rt[b + 5] - 4);
+                    let ttl = clamp(smaller(rt[b + 3], minimum), lim[2], lim[3]);
+                    let end = put_record(ent, p, tmp[0..n], reply, 6, 1, ttl, rt[b + 4], rt[b + 5]);
+                    if end >= 0 {
+                        p = end;
+                        negative = 1;
+                        life = ttl;
+                        found = true;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if !found {
+            bump(cache, 3);
+            return 1;
+        }
+    }
+    dns.put16(ent, prefix() + 6, kept);
+    dns.put16(ent, prefix() + 8, negative);
+    put64(ent, 0, now);
+    store.tick(cache.store, now);
+    let key = contents(cache.key)[0..klen];
+    let code = store.set(cache.store, key, store.hash_of(cache.store, key), ent[0..p], now + life * 1000);
+    if code != 0 {
+        bump(cache, 4);
+        return 2;
+    }
+    bump(cache, 2);
+    return 0;
+}
