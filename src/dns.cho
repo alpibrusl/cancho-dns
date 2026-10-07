@@ -1,0 +1,576 @@
+edition 5;
+
+module dns;
+
+// `dns` -- the DNS wire format (RFC 1035, EDNS0 RFC 6891), the part a forwarding resolver needs: parse one whole
+// message, expand a name, and write the few messages the resolver itself makes. `docs/design.md` sections 5 and 8
+// are the contract this file keeps.
+//
+// Sans-io, like `std.http` and cancho-cache's `resp`: `parse` is a pure function from the bytes of one message to
+// "this is well formed, here is where everything is" or a negative `error_*`. It allocates nothing and **never
+// traps**, whatever the bytes (`tests/dns_test.cho` says so over every name of up to six bytes, and
+// `tests/fuzz_codec.py` over mutated real messages). Everything comes back as offsets into the caller's buffer, in
+// a table the caller owns, so a well-formed message costs no copy.
+//
+// What it refuses, each with its own code and rule tag (`error_tag`), is what `docs/design.md` section 5 lists:
+// a message with other than one question, a name over 255 bytes or with a label type that is not a plain label, a
+// compression pointer that does not point strictly backwards (to a byte after the header) or that chains more than
+// 16 times, more records than the limits below, an OPT record that is misplaced, repeated or ill formed, record data
+// that does not fit its type, and bytes after the last record.
+//
+// The table `parse` fills (indices, see the `t_*` functions):
+//
+//     [0] id   [1] flags   [2] qdcount (always 1)   [3] ancount   [4] nscount   [5] arcount
+//     [6] where the question name starts   [7] qtype   [8] qclass
+//     [9] index of the OPT record among the records, or -1
+//     [10] OPT: requested UDP payload size   [11] OPT: extended RCODE (high 8 bits)   [12] OPT: version
+//     [13] OPT: flags
+//     [14 + 6i ...] record i: name starts, type, class, ttl (0 if the wire's has the top bit set, RFC 2181), rdata
+//                   starts, rdata length
+//
+// Records are numbered answer, then authority, then additional. `slots()` is how big the table has to be.
+
+// The most records in a section (docs/design.md section 5).
+pub fn max_answers() -> [] int {
+    return 64;
+}
+
+pub fn max_authority() -> [] int {
+    return 16;
+}
+
+pub fn max_additional() -> [] int {
+    return 32;
+}
+
+pub fn max_records() -> [] int {
+    return max_answers() + max_authority() + max_additional();
+}
+
+pub fn slots() -> [] int {
+    return 14 + 6 * max_records();
+}
+
+// A name on the wire is at most 255 bytes once expanded, and a compression chain may be followed this many times.
+pub fn max_name() -> [] int {
+    return 255;
+}
+
+pub fn max_hops() -> [] int {
+    return 16;
+}
+
+// Where the header ends and the question begins.
+pub fn header_size() -> [] int {
+    return 12;
+}
+
+// What `parse` answers: the length of the message, or one of these. Each has a rule tag (`error_tag`) and the
+// RCODE a server answers a bad query with (`error_rcode`).
+pub fn error_short_header() -> [] int {
+    return 0 - 1;
+}
+
+pub fn error_bad_counts() -> [] int {
+    return 0 - 2;
+}
+
+pub fn error_name_too_long() -> [] int {
+    return 0 - 3;
+}
+
+pub fn error_label_too_long() -> [] int {
+    return 0 - 4;
+}
+
+pub fn error_bad_pointer() -> [] int {
+    return 0 - 5;
+}
+
+pub fn error_truncated() -> [] int {
+    return 0 - 6;
+}
+
+pub fn error_too_many_records() -> [] int {
+    return 0 - 7;
+}
+
+pub fn error_bad_edns() -> [] int {
+    return 0 - 8;
+}
+
+pub fn error_bad_rdata() -> [] int {
+    return 0 - 9;
+}
+
+pub fn error_trailing_bytes() -> [] int {
+    return 0 - 10;
+}
+
+// Not a fault in a message: the buffer a message was to be written into is too small.
+pub fn error_no_room() -> [] int {
+    return 0 - 11;
+}
+
+// Record types the parser looks inside, because their data holds names that must be walked to be trusted.
+fn type_a() -> [] int {
+    return 1;
+}
+
+fn type_ns() -> [] int {
+    return 2;
+}
+
+fn type_cname() -> [] int {
+    return 5;
+}
+
+fn type_soa() -> [] int {
+    return 6;
+}
+
+fn type_ptr() -> [] int {
+    return 12;
+}
+
+fn type_mx() -> [] int {
+    return 15;
+}
+
+fn type_aaaa() -> [] int {
+    return 28;
+}
+
+fn type_srv() -> [] int {
+    return 33;
+}
+
+fn type_dname() -> [] int {
+    return 39;
+}
+
+pub fn type_opt() -> [] int {
+    return 41;
+}
+
+fn u16_at[&d](data: &d [byte], at: int) -> [] int {
+    return int_of(data[at]) * 256 + int_of(data[at + 1]);
+}
+
+fn u32_at[&d](data: &d [byte], at: int) -> [] int {
+    return u16_at(data, at) * 65536 + u16_at(data, at + 2);
+}
+
+// Walk the name that starts at `at` and answer where it ends in the message (the byte after its terminating zero, or
+// after the first compression pointer), or a negative error. Never reads outside `data`.
+//
+// A pointer must point strictly backwards and not into the header, which with the hop limit and the 255-byte limit
+// makes the walk finite and small: at most 127 labels and 16 pointers.
+pub fn name_end[&d](data: &d [byte], at: int) -> [] int {
+    var pos = at;
+    var next = 0 - 1;
+    var expanded = 0;
+    var hops = 0;
+    while pos < len(data) {
+        let c = int_of(data[pos]);
+        if c == 0 {
+            // No length check here: the label branch below keeps `expanded` under `max_name()`, so adding the
+            // root's one byte cannot pass it.
+            if next < 0 {
+                next = pos + 1;
+            }
+            return next;
+        }
+        let kind = c / 64;
+        if kind == 0 {
+            // A label that runs past the end leaves the loop, and the walk answers `error_truncated` below.
+            expanded = expanded + 1 + c;
+            if expanded >= max_name() {
+                return error_name_too_long();
+            }
+            pos = pos + 1 + c;
+        } else if kind == 3 {
+            if pos + 1 >= len(data) {
+                return error_truncated();
+            }
+            let target = c % 64 * 256 + int_of(data[pos + 1]);
+            if next < 0 {
+                next = pos + 2;
+            }
+            if target >= pos || target < header_size() {
+                return error_bad_pointer();
+            }
+            hops = hops + 1;
+            if hops > max_hops() {
+                return error_bad_pointer();
+            }
+            pos = target;
+        } else {
+            // 01 and 10 in the top two bits: a length over 63, or the extended label types RFC 6891 retired.
+            return error_label_too_long();
+        }
+    }
+    return error_truncated();
+}
+
+// Write the name at `at` into `out` with no compression, labels as they are (case kept). Answers how many bytes
+// that is, or a negative error. `out` must hold `max_name()` bytes; a shorter one is `error_name_too_long`. The name
+// is walked by `name_end` first, so the copy below cannot fail.
+pub fn name_expand[&d, &o](data: &d [byte], at: int, out: &!o [byte]) -> [] int {
+    let end = name_end(data, at);
+    if end < 0 {
+        return end;
+    }
+    var pos = at;
+    var n = 0;
+    while pos < len(data) {
+        let c = int_of(data[pos]);
+        if c == 0 {
+            if n >= len(out) {
+                return error_name_too_long();
+            }
+            out[n] = byte_of(0);
+            return n + 1;
+        }
+        if c / 64 == 3 {
+            pos = c % 64 * 256 + int_of(data[pos + 1]);
+        } else {
+            if n + 1 + c > len(out) {
+                return error_name_too_long();
+            }
+            var k = 0;
+            while k <= c {
+                out[n + k] = data[pos + k];
+                k = k + 1;
+            }
+            n = n + 1 + c;
+            pos = pos + 1 + c;
+        }
+    }
+    return error_truncated();
+}
+
+// Lower-case an ASCII letter, which is all DNS case folding is (RFC 4343).
+pub fn fold(c: int) -> [] int {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32;
+    }
+    return c;
+}
+
+// Do two expanded names (as `name_expand` writes them) match, ignoring ASCII case?
+pub fn names_equal[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        if fold(int_of(x[i])) != fold(int_of(y[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Does the data of a record fit its type? `end` is where it must stop. Names inside are walked, so a later expansion
+// cannot meet a bad one.
+//
+// A, AAAA and SRV are defined for the Internet class only: in another class their data is opaque here, as it is to a
+// resolver that forwards only IN (`docs/design.md` section 5). The types whose data is names are the same in every class.
+fn rdata_ok[&d](data: &d [byte], rtype: int, class: int, at: int, size: int) -> [] bool {
+    let end = at + size;
+    let internet = class == 1;
+    if rtype == type_a() && internet {
+        return size == 4;
+    }
+    if rtype == type_aaaa() && internet {
+        return size == 16;
+    }
+    if rtype == type_ns() || rtype == type_cname() || rtype == type_ptr() || rtype == type_dname() {
+        return name_end(data, at) == end;
+    }
+    if rtype == type_mx() {
+        if size < 3 {
+            return false;
+        }
+        return name_end(data, at + 2) == end;
+    }
+    if rtype == type_srv() && internet {
+        if size < 7 {
+            return false;
+        }
+        return name_end(data, at + 6) == end;
+    }
+    if rtype == type_soa() {
+        let first = name_end(data, at);
+        if first < 0 {
+            return false;
+        }
+        let second = name_end(data, first);
+        if second < 0 {
+            return false;
+        }
+        return second + 20 == end;
+    }
+    return true;
+}
+
+// Do the options inside an OPT record's data tile it exactly? (code 2 bytes, length 2 bytes, that many bytes.)
+fn options_ok[&d](data: &d [byte], at: int, size: int) -> [] bool {
+    let end = at + size;
+    var pos = at;
+    while pos < end {
+        if pos + 4 > end {
+            return false;
+        }
+        pos = pos + 4 + u16_at(data, pos + 2);
+    }
+    return pos == end;
+}
+
+// Parse the message in `data`, which is all of it (a datagram, or one TCP frame with its length prefix already
+// taken off). Answers `len(data)` and fills `table`, or a negative `error_*`.
+pub fn parse[&d, &t](data: &d [byte], table: &!t [int]) -> [] int {
+    if len(data) < header_size() {
+        return error_short_header();
+    }
+    let qd = u16_at(data, 4);
+    let an = u16_at(data, 6);
+    let ns = u16_at(data, 8);
+    let ar = u16_at(data, 10);
+    if qd != 1 {
+        return error_bad_counts();
+    }
+    if an > max_answers() || ns > max_authority() || ar > max_additional() {
+        return error_too_many_records();
+    }
+    table[0] = u16_at(data, 0);
+    table[1] = u16_at(data, 2);
+    table[2] = qd;
+    table[3] = an;
+    table[4] = ns;
+    table[5] = ar;
+    table[9] = 0 - 1;
+    table[10] = 0;
+    table[11] = 0;
+    table[12] = 0;
+    table[13] = 0;
+
+    let question_end = name_end(data, header_size());
+    if question_end < 0 {
+        return question_end;
+    }
+    if question_end + 4 > len(data) {
+        return error_truncated();
+    }
+    table[6] = header_size();
+    table[7] = u16_at(data, question_end);
+    table[8] = u16_at(data, question_end + 2);
+
+    var pos = question_end + 4;
+    let total = an + ns + ar;
+    var i = 0;
+    while i < total {
+        let named = name_end(data, pos);
+        if named < 0 {
+            return named;
+        }
+        if named + 10 > len(data) {
+            return error_truncated();
+        }
+        let rtype = u16_at(data, named);
+        let class = u16_at(data, named + 2);
+        let ttl = u32_at(data, named + 4);
+        let size = u16_at(data, named + 8);
+        let start = named + 10;
+        if start + size > len(data) {
+            return error_truncated();
+        }
+        if !rdata_ok(data, rtype, class, start, size) {
+            return error_bad_rdata();
+        }
+        if rtype == type_opt() {
+            // One OPT, in the additional section, owned by the root, with options that tile its data.
+            if i < an + ns || table[9] >= 0 {
+                return error_bad_edns();
+            }
+            if named != pos + 1 || int_of(data[pos]) != 0 {
+                return error_bad_edns();
+            }
+            if !options_ok(data, start, size) {
+                return error_bad_edns();
+            }
+            table[9] = i;
+            table[10] = class;
+            table[11] = ttl / 16777216;
+            table[12] = ttl / 65536 % 256;
+            table[13] = ttl % 65536;
+        }
+        let row = 14 + 6 * i;
+        table[row] = pos;
+        table[row + 1] = rtype;
+        table[row + 2] = class;
+        // RFC 2181 section 8: a TTL with the top bit set is zero.
+        table[row + 3] = ttl;
+        if ttl >= 2147483648 {
+            table[row + 3] = 0;
+        }
+        table[row + 4] = start;
+        table[row + 5] = size;
+        pos = start + size;
+        i = i + 1;
+    }
+    if pos != len(data) {
+        return error_trailing_bytes();
+    }
+    return pos;
+}
+
+// The rule tag of each error (`docs/design.md` section 5), as data: a log line and a `check` answer say these.
+pub fn error_tag(code: int) -> [] &static [byte] {
+    if code == error_short_header() {
+        return "dns-bad-header";
+    }
+    if code == error_bad_counts() {
+        return "dns-bad-counts";
+    }
+    if code == error_name_too_long() {
+        return "dns-name-too-long";
+    }
+    if code == error_label_too_long() {
+        return "dns-label-too-long";
+    }
+    if code == error_bad_pointer() {
+        return "dns-bad-pointer";
+    }
+    if code == error_truncated() {
+        return "dns-truncated";
+    }
+    if code == error_too_many_records() {
+        return "dns-too-many-records";
+    }
+    if code == error_bad_edns() {
+        return "dns-bad-edns";
+    }
+    if code == error_bad_rdata() {
+        return "dns-bad-rdata";
+    }
+    if code == error_no_room() {
+        return "dns-no-room";
+    }
+    return "dns-trailing-bytes";
+}
+
+// The RCODE a server answers a malformed query with: FORMERR (1) for all of them, and SERVFAIL (2) when it was
+// our own buffer that was too small.
+pub fn error_rcode(code: int) -> [] int {
+    if code == error_no_room() {
+        return 2;
+    }
+    return 1;
+}
+
+// ---- Writing messages ------------------------------------------------------------------------------------------
+
+fn put8[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    out[at] = byte_of(v);
+    return at + 1;
+}
+
+fn put16[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    out[at] = byte_of(v / 256);
+    out[at + 1] = byte_of(v % 256);
+    return at + 2;
+}
+
+fn put32[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    let p = put16(out, at, v / 65536);
+    return put16(out, p, v % 65536);
+}
+
+// An OPT record: the root as owner, the payload size we accept, the extended RCODE and no options.
+fn put_opt[&o](out: &!o [byte], at: int, udp_size: int, rcode: int) -> [] int {
+    var p = put8(out, at, 0);
+    p = put16(out, p, type_opt());
+    p = put16(out, p, udp_size);
+    p = put32(out, p, rcode / 16 * 16777216);
+    return put16(out, p, 0);
+}
+
+// The size of an OPT record with no options.
+fn opt_size() -> [] int {
+    return 11;
+}
+
+// Write a query for `qname` (a name as `name_expand` writes it) into `out`: a fresh `id`, the recursion-desired bit
+// if asked, one question, and an OPT record advertising `udp_size` if that is not 0. Answers the length, or
+// `error_no_room`.
+pub fn encode_query[&o, &n](out: &!o [byte], id: int, qname: &n [byte], qtype: int, qclass: int, udp_size: int, recursion: bool) -> [] int {
+    var size = header_size() + len(qname) + 4;
+    var additional = 0;
+    if udp_size > 0 {
+        size = size + opt_size();
+        additional = 1;
+    }
+    if size > len(out) {
+        return error_no_room();
+    }
+    var flags = 0;
+    if recursion {
+        flags = 256;
+    }
+    var p = put16(out, 0, id);
+    p = put16(out, p, flags);
+    p = put16(out, p, 1);
+    p = put16(out, p, 0);
+    p = put16(out, p, 0);
+    p = put16(out, p, additional);
+    var i = 0;
+    while i < len(qname) {
+        out[p + i] = qname[i];
+        i = i + 1;
+    }
+    p = p + len(qname);
+    p = put16(out, p, qtype);
+    p = put16(out, p, qclass);
+    if udp_size > 0 {
+        p = put_opt(out, p, udp_size, 0);
+    }
+    return p;
+}
+
+// Write an error reply to the (parsed) query in `query` into `out`: its id, its opcode and recursion-desired bit, QR
+// and RA set, `rcode`, its question echoed, and -- because the query had one -- an OPT record advertising
+// `udp_size`, carrying the high bits of `rcode` if it is over 15. Answers the length, or `error_no_room`. The
+// question is copied from the query unchanged: the first name of a message cannot be compressed (a pointer would
+// have to point before the header's end).
+pub fn encode_error[&o, &q, &t](out: &!o [byte], query: &q [byte], table: &t [int], rcode: int, udp_size: int) -> [] int {
+    let question_end = name_end(query, header_size()) + 4;
+    var size = question_end;
+    var additional = 0;
+    if table[9] >= 0 {
+        size = size + opt_size();
+        additional = 1;
+    }
+    if size > len(out) {
+        return error_no_room();
+    }
+    let flags = 32768 + table[1] % 32768 / 2048 * 2048 + table[1] / 256 % 2 * 256 + 128 + rcode % 16;
+    var p = put16(out, 0, table[0]);
+    p = put16(out, p, flags);
+    p = put16(out, p, 1);
+    p = put16(out, p, 0);
+    p = put16(out, p, 0);
+    p = put16(out, p, additional);
+    var i = header_size();
+    while i < question_end {
+        out[i] = query[i];
+        i = i + 1;
+    }
+    p = question_end;
+    if additional == 1 {
+        p = put_opt(out, p, udp_size, rcode);
+    }
+    return p;
+}
