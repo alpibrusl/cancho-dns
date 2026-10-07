@@ -283,6 +283,50 @@ Not done in D1, said so.
 * No upstream, cache or source-port randomisation (D2 to D4).
 * The server is tested on loopback only, and the differential test of the encoder against dnspython is still open from D0.
 
+## 14. D2, the cache: design and gate, written before the code
+
+*Status: gate fixed, code not yet written. Corrected in place if a claim below turns out false.*
+
+**Reuse.** `src/store.cho` is cancho-cache's store (the arena, the open-addressing index with backward-shift deletion, sampled LRU, lazy expiry plus a bounded
+sweep, incremental compaction), **vendored at cancho-cache `e196d5a` and not edited** (it is not a library yet; a vendored file with its origin in the
+header is the honest form until it is). Nothing is allocated after `open`, which is what gate 3 needs.
+
+**Key and value.** Key: the question name in lower-case wire form (RFC 4343 folding), then type and class, 2 bytes each. Value: the *answer chain* of
+section 6 in a position-independent form: a 4-byte header (rcode, answer count, authority count, flags), the stored-at time, and for each record its
+owner name, type, class, original TTL and rdata **with embedded names expanded** (no compression pointers, so a record can be written at any offset of a
+later reply). Types whose rdata holds names are re-encoded for CNAME, NS, PTR, DNAME, MX, SRV and SOA; a record of any other type is stored opaque. A reply that
+the re-encoder cannot fit is not cached (`uncacheable` is counted), never cached wrongly.
+
+**What is kept** (section 6, now exact): starting at the question name, an answer record is kept if its owner equals the current name and it is a CNAME (the
+current name becomes its target) or of the question's type; nothing else of the answer section, nothing of the additional section. A negative answer
+(NXDOMAIN, or NOERROR with nothing kept) keeps the SOA of the authority section and caches for `min(SOA TTL, SOA MINIMUM)` (RFC 2308), clamped to
+[10 s, 1 hour]; positive TTLs are clamped to [10 s, 1 day] and the entry lives for the smallest kept TTL. `SERVFAIL` is stored for 5 s. Only `NOERROR`,
+`NXDOMAIN` and `SERVFAIL` are cached; a reply with TC set is never cached.
+
+**On a hit** the reply is built from the entry and the query: the query's ID, its question as sent (its case), `QR RD RA`, each TTL reduced by the
+seconds since it was stored (never below the clamp's floor reached at 0 remaining: an entry is gone when its smallest TTL is, so no TTL is written as 0
+from a live entry except where the original was 0), and the OPT record of the client's EDNS if it sent one. The existing truncation applies to it.
+
+**Until D3 the "upstream" is the stub**: a miss is answered by `stub.respond` and the reply goes through the same insertion code a forwarded reply will, so what
+is exercised is the cache, not a stand-in for it. `n<k>.` and `t<k>.` are as in section 13; `ttl<k>.` gives one A record with TTL k, `nx` names give
+NXDOMAIN with an SOA (TTL and MINIMUM 30). A CHAOS-class TXT query for `stats.bind.` returns the counters (hits, misses, stored, evicted, expired,
+uncacheable, live, used bytes), so tests can see the cache from outside.
+
+**Gate 3, fixed now.**
+1. *Unit* (`tests/cache_test.cho`): TTLs are clamped and decremented; the smallest kept TTL ends the entry; negative caching uses SOA `MINIMUM` and the clamp;
+   a CNAME chain is kept and a record planted outside it is dropped; a reply with TC, an unsupported rcode or an unfitting record is not cached; names
+   differing only in case share an entry; an entry over its time is a miss; filling a small store with 10,000 distinct names never exceeds `max_keys` or the
+   arena and evicts.
+2. *Black-box, through the server* (`tests/cache_server_test.py`, dnspython): a repeated query is a hit (counters) and its TTL falls; with the clamp floor
+   set to 1 s at start a 1-second record is a miss again after 2 s; an NXDOMAIN is served from cache; a hot name survives a flood.
+3. *Memory bounded*: 100,000 distinct names through a server with a 1 MiB arena; `VmRSS` after the first 10,000 and after the last differ by under 5%,
+   `evicted` is over 0, `live` never exceeds the key cap, and a name queried again every 100 queries throughout still hits. This runs in CI.
+4. *The gate can fail*: mutants of the cache (TTL not decremented, clamp floor removed, SOA ignored for negatives, chain filter off, case-sensitive key,
+   no eviction) are each killed by the tests above; any survivor is listed here with the reason.
+
+Cell A (UDP cache hit, 50 clients) and cell D (memory after 100,000 distinct names) are *recorded* in D2 against `dnsperf` if it can be installed in CI,
+and reported plainly whichever way they point; if not, the cell is reported as not measured, with the reason. No ratio is claimed from this step.
+
 ## Reproduce (section 2)
 
 ```
