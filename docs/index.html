@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cancho-dns: a DNS resolver you can audit</title>
-<meta name="description" content="A forwarding and caching DNS resolver written in cancho: a bounded parser, a fixed arena, and an authority report that names the upstreams it can reach. Design stage.">
+<meta name="description" content="A forwarding and caching DNS resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code and no files but entropy. Design stage.">
 <meta property="og:title" content="cancho-dns: a DNS resolver you can audit">
 <meta property="og:description" content="A bounded, capability-limited DNS resolver in cancho. Design stage: nothing is built yet.">
 <meta property="og:image" content="https://alpibrusl.github.io/cancho-dns/assets/cancho-dns-logo-256.png">
@@ -147,7 +147,7 @@ ul.why span { color: var(--muted); font-size: .95rem; }
   <div>
     <p class="badge"><i></i>Design stage &middot; nothing is built yet</p>
     <h1>A DNS resolver you can audit.</h1>
-    <p class="lead">A forwarding and caching resolver written in cancho: a bounded parser, a fixed arena, and an authority report that names the upstreams it can reach and nothing else.</p>
+    <p class="lead">A forwarding and caching resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code, no processes and no file but its entropy source.</p>
     <p class="sub">DNS is on every network, and its resolvers have a long history of memory-safety bugs in the code that parses packets. <code>cancho-dns</code> is the same job with no <code>Ffi</code> and no <code>unsafe</code>, and with limits that are checked, not hoped for.</p>
     <div class="cta"><a class="btn primary" href="#v1">What v1 will do</a><a class="btn ghost" href="https://github.com/alpibrusl/cancho-dns/issues/18">The plan</a></div>
   </div>
@@ -159,7 +159,7 @@ ul.why span { color: var(--muted); font-size: .95rem; }
   <p class="sub">A resolver parses untrusted packets from the network all day, and holds a cache an attacker would like to poison. That makes two properties worth having and worth proving.</p>
   <div class="grid">
     <div><h3>The parser cannot be tricked into a crash</h3><p>Every input is bounded, every refusal has a rule tag, and no input reaches a panic. Name compression pointers, record counts and message sizes all have limits with their own refusals.</p></div>
-    <div><h3>The program can only reach its upstreams</h3><p>The authority report is derived by the compiler. The aim is for it to name the exact upstream addresses, so a bug in the parser cannot make the resolver talk to arbitrary hosts.</p></div>
+    <div><h3>No foreign code, no files, no processes</h3><p>The authority report is derived by the compiler and checked in CI. It cannot yet name the exact upstreams: cancho&rsquo;s network capability is narrowed once and read by prefix, so v1 keeps the upstream set in a compiled-in table and says so (see the design document).</p></div>
     <div><h3>Memory is sized at start</h3><p>The cache lives in a fixed arena, as in <a href="https://github.com/alpibrusl/cancho-cache">cancho-cache</a>. Nothing grows without bound, and pauses are bounded by a slice of work.</p></div>
     <div><h3>Built to be read by an agent</h3><p>Errors are data with stable rule tags and repairs, a <code>check</code> and an <code>explain</code> command say what a configuration or a query would do without sending anything, and the tool describes itself.</p></div>
   </div>
@@ -191,9 +191,9 @@ ul.why span { color: var(--muted); font-size: .95rem; }
   <p class="sub">One thread and one poller, as in the cache. This is the target row, not a measured one: it will be derived by <code>cancho authority</code> and checked in CI against a ceiling file, and it is what the design document has to settle first.</p>
   <div class="term" role="img" aria-label="The target authority row, a design aim"><div class="bar"><i></i><i></i><i></i></div>
 <pre><span class="c"># target, not built: what the compiler should report for the resolver</span>
-args, clock, heap, io_write, net_in("0.0.0.0:53"), net_out(<span class="c">the configured upstreams</span>)
-<span class="c"># and no file, no ffi</span></pre></div>
-  <p class="note">One open question is real: the compiler narrows a capability to a <em>literal</em>, so an upstream list read from a file at run time cannot be proven. The design has to choose between a generated, compiled-in upstream set (exact proof, one binary per deployment), a coarser label enforced in code, or a mix. The README's claim is conditional on that answer.</p>
+args, clock, heap, err_write, udp_recv, udp_send, conn_*, poll, net_in(""), net_out(""), fs_read("/dev/urandom")
+<span class="c"># no ffi, no fs_write, no exec; the upstream set is a table in code, not in the type</span></pre></div>
+  <p class="note">The open question has an answer, and it is not the one hoped for: measured on cancho, a network capability is narrowed once, its bound is read as <code>host:port</code> one way and as a port the other, and the host is matched by prefix, so a resolver that listens and dials cannot have its upstreams proven by the compiler today. The design ships v1 without that proof and files the language work it needs.</p>
 </section>
 
 <section id="fit">

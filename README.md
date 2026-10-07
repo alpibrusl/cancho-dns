@@ -2,13 +2,13 @@
 
 # cancho-dns
 
-**A DNS resolver you can audit.** A forwarding and caching resolver written in [cancho](https://github.com/alpibrusl/cancho): a bounded parser, a cache in a fixed arena, no `Ffi` and no `unsafe`, and an authority report that is meant to name the upstreams it can reach and nothing else. A bug in the packet parser cannot turn it into a way to reach arbitrary hosts.
+**A DNS resolver you can audit.** A forwarding and caching resolver written in [cancho](https://github.com/alpibrusl/cancho): a bounded parser, a cache in a fixed arena, no `Ffi` and no `unsafe`, and an authority report that shows it has no foreign code, no processes and no file but its entropy source. A bug in the packet parser is a bounds trap, not a memory-safety hole. **Corrected from the first draft:** the report was meant to name the exact upstreams the program can reach, and cancho cannot prove that today (measured in [`docs/design.md`](docs/design.md) §2), so in v1 the upstream set is a compiled-in table enforced and checked in code, and the compiler-checked claim waits on language work.
 
-**Status: design stage. Nothing is built.** There is no code, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic, [cancho-dns#18](https://github.com/alpibrusl/cancho-dns/issues/18). The first deliverable is `docs/design.md`: scope, the authority row, the cache and security policy, the gates and the benchmark cells, written before any code.
+**Status: design stage. Nothing is built.** There is no code, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic, [cancho-dns#18](https://github.com/alpibrusl/cancho-dns/issues/18). The first deliverable, `docs/design.md`, is drafted: scope, the authority row, the cache and security policy, the gates and the benchmark cells, written before any code, with its proposed numbers waiting for the maintainer.
 
 ## Why
 
-A resolver parses untrusted packets from the network all day and keeps a cache that an attacker would like to poison. Its popular implementations are written in C and have a long record of memory-safety bugs in exactly that parser. This project is the same job with bounds that are checked and an authority that is proven by the compiler.
+A resolver parses untrusted packets from the network all day and keeps a cache that an attacker would like to poison. Its popular implementations are written in C and have a long record of memory-safety bugs in exactly that parser. This project is the same job with bounds that are checked and an authority that is derived by the compiler (for the network, only as far as cancho's `Net` can say: see below).
 
 The model is [`cancho-cache`](https://github.com/alpibrusl/cancho-cache): one thread, one poller, memory sized at start, every input bounded with its own refusal, and measurements against the incumbents fixed before the code.
 
@@ -18,7 +18,7 @@ A forwarding cache:
 
 - DNS over UDP and TCP, with EDNS0 and truncation;
 - a cache with TTLs, negative caching and LRU eviction, in a fixed arena;
-- forwarding to a fixed set of upstream resolvers, with timeouts and health;
+- forwarding to a fixed set of upstream resolvers (a compiled-in table in v1), with timeouts and health;
 - local records from a small bounded file, and overrides;
 - the defences that matter: random transaction IDs and source ports, 0x20 case randomisation, bailiwick checks, response rate limiting;
 - bounded JSON logs and metrics, with no files written;
@@ -26,9 +26,9 @@ A forwarding cache:
 
 Not in v1: iterating from the root servers, DNSSEC validation (stage 2; cancho has RSA, ECDSA and Ed25519), DNS over TLS and HTTPS (TLS needs foreign code today, which would make the authority report unbounded), zone transfers, dynamic update, views and clustering.
 
-## An open question that decides the headline
+## The question that decided the headline, answered
 
-The compiler narrows a capability to a **literal**, so an upstream list read from a file at run time cannot be proven by the authority report. The design has to choose between a generated, compiled-in upstream set (an exact proof, one binary per deployment), a coarser label enforced in code (which gives up the headline), or a mix. The claim above is conditional on that answer.
+The epic asked how an upstream set could become a literal the compiler can check. Measured on cancho, the answer is that it cannot yet, for any layout: a `Net` is narrowed once; its one bound string is read as `host:port` outbound and as a port inbound, so a program that both listens and dials cannot carry a narrowed `Net` at all; and the host half is a plain prefix (a bound of `127.0.0.1` admitted `127.0.0.10`). The design therefore ships v1 on an unnarrowed `Net` with the upstream set in a compiled-in table, says so in the report, and files the language prerequisite: separate inbound and outbound bounds, set-valued bounds, and exact host matching. Until that lands, "names the exact upstreams" is a target, not a claim. Details and the reproduction are in [`docs/design.md`](docs/design.md) §2 and §3.
 
 ## What we expect, stated before measuring
 
