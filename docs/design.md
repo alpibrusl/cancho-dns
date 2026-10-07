@@ -40,7 +40,7 @@ Consequence: **with cancho as it is, no compiler-checked statement of the form "
 a forwarding resolver**, by a generator, by a hybrid, or by any layout of one binary. The epic's question is answered by the language, not by
 a design choice here.
 
-What cancho would need, recorded as a prerequisite to be filed against `alpibrusl/cancho` (the same way UDP was, #355):
+What cancho would need, filed as a prerequisite: [alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362) (the same way UDP was, #355):
 
 * separate inbound and outbound bounds (two capabilities from `split`, or two bounds on one `Net`);
 * a bound that is a **set** of hosts (there is precedent: `Signals` narrows as a set, `docs/signals.md` §2.1);
@@ -198,7 +198,7 @@ Any of these is written up here, in place, as the result.
 
 ## 11. Open questions for the maintainer
 
-1. Confirm section 3: ship v1 on an unnarrowed `Net` with the compiled-in table, and file the cancho prerequisite of section 2?
+1. Confirm section 3: ship v1 on an unnarrowed `Net` with the compiled-in table? (The cancho prerequisite of section 2 is filed: alpibrusl/cancho#362.)
 2. Confirm the proposed limits (section 5), the cache clamps and RRL values (section 6), and the benchmark criterion (section 8).
 3. Is Unbound the right gated comparator, or should the gate be against the best of all five per cell?
 4. What does `"bounded": true` mean in `cancho authority`'s JSON? It reads true for the empty bound.
