@@ -8,7 +8,7 @@ import dns;
 // It is the codec behind a pipe, nothing more; the resolver does not use it.
 //
 //     OK <id> <flags> <qd> <an> <ns> <ar> <qtype> <qclass> <qname hex> <opt index> <udp size> <ext rcode> <version> <edns flags>
-//        then one group per record:  | <type> <class> <ttl> <rdata length> <owner name hex>
+//        then one group per record:  | <type> <class> <ttl> <rdata length> <rdata offset> <owner name hex>
 
 fn hexval(c: int) -> [] int {
     if c >= '0' && c <= '9' {
@@ -83,6 +83,7 @@ fn answer[&i, &d, &t](io: &!i Io, data: &d [byte], table: &!t [int]) -> [io_writ
             number(io, table[row + 2]);
             number(io, table[row + 3]);
             number(io, table[row + 5]);
+            number(io, table[row + 4]);
             putchar(io, ' ');
             let m = dns.name_expand(data, table[row], name);
             print_hex(io, name[0..m]);
