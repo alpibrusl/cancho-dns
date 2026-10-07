@@ -346,8 +346,8 @@ aim collisions at the index; D3 closes that, and until then it is a known weakne
   runtime's ring of 65,536 peer tickets (`docs/udp.md`) being written for the first time, about 32 bytes each, **not the cache**: this is inferred from the
   match with 65,536, not isolated by a run without the ring. The gate now reads RSS after that ring has been written round once.
 * *Part 4*: `tests/mutate_cache.py`, 16 mutants of `src/cache.cho` (decrement, floor, ceiling, chain filter, type filter, case fold, eviction, TC, smallest TTL, SOA
-  `MINIMUM`, SOA-less negative, size limit, id, question, question match, SERVFAIL TTL); **16 of 16 killed**. Three of them survived the first set of tests
-  (type filter, TC with an answer, mismatched type) and the tests were strengthened, not the mutants dropped.
+  `MINIMUM`, SOA-less negative, size limit, id, question, question match, SERVFAIL TTL); **16 of 16 killed**. Two of them survived the first set of tests
+  (type filter, mismatched type) and the tests were strengthened, not the mutants dropped; the TC test was also made to carry an answer, as a TC reply without one was never cacheable anyway.
 * *Gate 6*: the server's authority ceiling is unchanged by the cache (same labels), diffed in CI.
 
 Not done in D2, said so.
