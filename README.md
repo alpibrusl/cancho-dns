@@ -4,7 +4,7 @@
 
 **A DNS resolver you can audit.** A forwarding and caching resolver written in [cancho](https://github.com/alpibrusl/cancho): a bounded parser, a cache in a fixed arena, no `Ffi` and no `unsafe`, and an authority report that is meant to name the upstreams it can reach and nothing else. A bug in the packet parser cannot turn it into a way to reach arbitrary hosts.
 
-**Status: design stage. Nothing is built.** There is no code, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic, [cancho-dns#17](https://github.com/alpibrusl/cancho-dns/issues/17). The first deliverable is `docs/design.md`: scope, the authority row, the cache and security policy, the gates and the benchmark cells, written before any code.
+**Status: design stage. Nothing is built.** There is no code, no benchmark and no claim beyond what is written here. The plan and its tasks are in the epic, [cancho-dns#18](https://github.com/alpibrusl/cancho-dns/issues/18). The first deliverable is `docs/design.md`: scope, the authority row, the cache and security policy, the gates and the benchmark cells, written before any code.
 
 ## Why
 
