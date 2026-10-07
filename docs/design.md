@@ -176,6 +176,31 @@ no ratio), as in cancho-cache.
 cell D, and E reported, not gated. dnsmasq, CoreDNS, Knot Resolver and PowerDNS Recursor (BIND if cheap) are measured and reported with the same
 tables, not gated. A cell that misses is written up here, in place, with by how much. The baseline table is empty until it is measured.
 
+### 8.1 How the benchmark will be run, against whom, on which metrics (expanded 2026-10-07, before any number exists)
+
+**Against.** The gated comparison is **Unbound** (single thread, forwarding, cache on, DNSSEC validation off, prefetch off, rate limiting off), because it is the
+reference small-footprint caching resolver. Reported, not gated: **dnsmasq** (the other resolver most people run as a forwarder), **CoreDNS** with the `forward` and `cache`
+plugins, **Knot Resolver**, **PowerDNS Recursor**, and **BIND** if it can be set up cheaply. Every one is configured the same way: forward to the local stub authoritative, cache of the same
+size, no validation, no logging to disk, no rate limiting, one worker pinned to one core, and the configuration files published with the numbers. A resolver that cannot be put into that
+shape is reported with the difference named.
+
+**Tools.** `dnsperf` for fixed-duration throughput and latency, `resperf` for the highest rate each resolver sustains without losses (the number a capacity plan wants), and a
+local stub authoritative (a minimal one of our own, or NSD) that answers instantly so the upstream is never the limit. Load generator, resolver and stub run on separate cores of one
+machine whose model, kernel and governor are written down; five interleaved rounds, medians and the spread reported. Each cell is re-run with a wider client to rule out a
+client-bound result (the rule of section 8 stands).
+
+**Metrics.**
+1. *Throughput*: queries per second at a loss under 0.1% in cells A (UDP cache hit), B (miss forwarded), C (TCP hit, persistent connections). `resperf`'s sustained maximum is reported next to them.
+2. *Latency*: p50, p99 and p99.9 at half of each server's own maximum (cell E), and the same at a fixed shared rate that all of them can meet, which is the comparison that is fair to the slowest.
+3. *Memory*: resident set at start, after 100,000 distinct names cached (cell D), and after an hour of steady load, which is where a leak or fragmentation would show. Bytes per cached record is derived from it.
+4. *CPU per query*: CPU seconds divided by queries answered, at the shared rate, because throughput on one core is the inverse of it but it also shows idle cost.
+5. *Behaviour under stress, pass or fail and counted*: a cache-miss flood (distinct names, none repeated) next to a hot name that must keep being answered; an upstream that stops answering (time to `SERVFAIL`, whether other queries stall); a slow-loris TCP client set against the connection cap; a 1,000-connection burst.
+6. *Correctness during the run*: every reply checked against the stub's known answer (wrong, missing or late-after-timeout answers counted). A faster resolver that answers wrongly under load does not win a cell.
+7. *Footprint*: binary size, dependencies, time to start and to be ready, lines of source, and the authority report, which is the one thing here no competitor has.
+
+**What the numbers can and cannot say.** This is one core on one machine with a loopback upstream: it measures the resolver's own work per query and its memory, not Internet behaviour (round-trip times, loss, upstream selection). It is a single-thread
+comparison, so it does not speak for Unbound or CoreDNS at their usual multi-thread settings. The criterion of section 8 (0.9x Unbound in A, B, C and 0.5x its memory in D) is unchanged; a miss is written up in place with by how much.
+
 ## 9. Plan, each step with its own gate
 
 | step | epic tasks | what | gate |
