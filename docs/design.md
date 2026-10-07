@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); nothing is built.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec, is built (section 12); nothing else is.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -204,6 +204,56 @@ Any of these is written up here, in place, as the result.
 2. ~~Confirm the proposed limits~~ **Confirmed** (sections 5, 6 and 8).
 3. Is Unbound the right gated comparator, or should the gate be against the best of all five per cell?
 4. What does `"bounded": true` mean in `cancho authority`'s JSON? It reads true for the empty bound.
+
+## 12. D0, built and measured: the codec
+
+`src/dns.cho` is the codec (`parse`, `name_end`, `name_expand`, `encode_query`, `encode_error`), `tests/dns_test.cho` its tests, `tests/driver.cho`
+the codec behind a pipe, `tests/differential_codec.py` gate 1, `tests/mutate_harness.py` gate 1's own mutation test, `tests/authority_check.py` and
+`authority/codec.ceiling` gate 6, and `.github/workflows/ci.yml` runs all of it on a compiler pinned by revision. Measured on cancho
+`0567e72` with the debug build; **CI's first run on this change is the result that counts for the pinned release build**, and is not yet in.
+
+**Gate 2 (no input reaches a trap), as met.** `cancho test`: 24 tests. The name parser is run over **every byte string of 0 to 6 bytes over eight
+symbols (299,593 of them)** after a header's worth of bytes (so pointers can land): each is refused or ends inside the message, and `name_expand`
+agrees (accepted names expand to at most 255 bytes). `parse` is run over a real response with **every one-byte and every two-byte change to eight
+symbols (66,240 parses)**: each answers a refusal or the message's length. Every proper prefix of a message is `dns-bad-header` or `dns-truncated`,
+never another code.
+
+**Mutation checks.** 26 deliberately wrong codec variants (a limit off by one, a check removed, the OPT rules, each record type's data check, the
+encoder's flags) are each caught by the unit tests. **The first version caught 13 of 29**: the OPT rules, the per-type data checks and the exact
+refusal code for a truncated message had no tests; they were written, and two checks that turned out to be dead code (the root's length check, which the
+label check already bounds, and a label's early truncation check, which leaving the loop already answers) were removed. One more variant, a pointer
+that points at itself, is **equivalent**: the hop limit refuses it with the same code, so it is not tested separately.
+
+**Gate 1 (differential against dnspython 2.8.0), as met.** Seed 20261007: 19 constructed messages and 34,931 in the corpus (2,687 valid, built with
+dnspython, and mutants of them). 9,082 are accepted by both with every compared field equal (header, question, every record's owner, type, class and
+TTL, data length where dnspython's re-encoding preserves it, the OPT fields); 25,793 are refused by both; 54 we accept and dnspython refuses, every one
+carrying data the codec does not look inside; 2 we refuse and dnspython accepts, both pointer rules. **The first run found two bugs in the codec**, now
+fixed and pinned by unit tests: a TTL with the top bit set was passed through (RFC 2181 section 8 makes it zero; dnspython does), and `A` data of the
+wrong length was refused in a class other than IN, where it is not an address. **And one class of leniency:** dnspython validates the contents of the
+EDNS options it knows (a cookie of the wrong length), and the codec treats options as opaque on purpose, so a message with such an option is accepted by
+us and refused by dnspython; the script allows exactly this and nothing else (`INTERPRETED_OPTIONS`).
+
+**The deliberate divergences, each asserted by a constructed message so the list cannot go stale:** dnspython **accepts** and the codec **refuses** a
+message with two questions or none (`dns-bad-counts`), with more than 64 answers, 16 authority or 32 additional records (`dns-too-many-records`), with a
+compression pointer into the header, and with a chain of 17 pointers (`dns-bad-pointer`). Both refuse: an OPT in the answers, two OPTs, an OPT owned by
+a pointer, options that do not tile, an `A` of 3 bytes, a trailing byte, a label type of 01, a forward pointer, a 256-byte name, an 11-byte message. Both
+accept: a 255-byte name, 16 pointer hops.
+
+**The harness can fail.** `tests/mutate_harness.py` builds 19 wrong codecs (flags read from the wrong bytes, a count from the wrong field, the question's
+type and class swapped, the TTL read short, the top-bit rule removed, the OPT fields swapped, trailing bytes accepted, forward pointers, reserved label
+types, a 256-byte name, a weak `A` check, two questions, 65 answers, 17 hops, a pointer into the header, an OPT in the answers) and the differential
+catches **19 of 19**. (The first version had a variant that changed nothing and a pattern that no longer matched the formatted source; both were the
+script's faults and are fixed.)
+
+**Gate 6 (authority), as met for what exists.** The only program is the driver, and its row is `io_read`, `io_write`, bounded, with no foreign symbol.
+`authority/codec.ceiling` says so; the check fails if the row grows, if the ceiling lists something nothing performs (a ceiling only comes down), or if the
+report is unbounded, and CI runs it once with a ceiling that must be refused so that the gate is shown able to fail.
+
+**Not done in D0, said so.**
+* The encoder (`encode_query`, `encode_error`) is tested by parsing what it writes with this codec, **not yet by dnspython**.
+* Record types whose data holds names beyond the ones the codec checks (NSEC, RRSIG's signer, KX, RP, and others) are opaque to it, as unknown types are.
+* The differential has been run on the debug compiler only; the pinned release build runs it in CI.
+* There is no server, no cache and no benchmark: the baseline table of section 8 is still empty.
 
 ## Reproduce (section 2)
 
