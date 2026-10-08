@@ -1,0 +1,133 @@
+edition 5;
+
+module forward;
+
+import dns;
+import rng;
+
+// `forward` -- the sans-io half of forwarding (`docs/design.md` section 15): what to send upstream, and whether what came back is
+// the answer to it. Nothing here touches a socket, so the whole of the matching rule is tested without one
+// (`tests/forward_test.cho`) and mutation-tested (`tests/mutate_spoof.py`).
+//
+// A reply is accepted only if its id is the one drawn, QR is set and the opcode is QUERY, and its question section is **byte for byte**
+// the one sent. That one comparison is the question check and the 0x20 check: the name's letters were sent in a random case, and a forger
+// who does not see the query cannot know it. (That the reply came from the right place is the kernel's: the socket is connected.)
+
+// Why a reply was not accepted; the rule tags are `reply_tag`'s.
+pub fn accepted() -> [] int {
+    return 0;
+}
+
+pub fn dropped_id() -> [] int {
+    return 1;
+}
+
+pub fn dropped_question() -> [] int {
+    return 2;
+}
+
+pub fn dropped_not_response() -> [] int {
+    return 3;
+}
+
+pub fn dropped_case() -> [] int {
+    return 4;
+}
+
+pub fn dropped_short() -> [] int {
+    return 5;
+}
+
+pub fn reply_tag(code: int) -> [] &static [byte] {
+    if code == dropped_id() {
+        return "dns-reply-id";
+    }
+    if code == dropped_question() {
+        return "dns-reply-question";
+    }
+    if code == dropped_not_response() {
+        return "dns-reply-not-response";
+    }
+    if code == dropped_case() {
+        return "dns-reply-case";
+    }
+    if code == dropped_short() {
+        return "dns-reply-short";
+    }
+    return "dns-reply-accepted";
+}
+
+fn letter(c: int) -> [] bool {
+    return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z';
+}
+
+// Give each ASCII letter of the expanded name `name` a random case (RFC 4343 says a server must treat the case as nothing and a
+// well behaved one echoes it). Length bytes are at most 63, below `A`, so they are never mistaken for letters. Answers how many letters
+// were changed.
+pub fn randomize_case[&r, &n](random: &!r rng.Rng, name: &!n [byte]) -> [] int {
+    var i = 0;
+    var changed = 0;
+    var pool = 0;
+    var left = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        if letter(c) {
+            if left == 0 {
+                pool = rng.byte(random);
+                left = 8;
+            }
+            if pool % 2 == 1 {
+                name[i] = byte_of(c - c / 32 % 2 * 32 + (1 - c / 32 % 2) * 32);
+                changed = changed + 1;
+            }
+            pool = pool / 2;
+            left = left - 1;
+        }
+        i = i + 1;
+    }
+    return changed;
+}
+
+// Is `reply` the answer to `sent`, the query as it went upstream (`id` is the id it carried)? 0 or a `dropped_*` code.
+pub fn judge[&r, &s](reply: &r [byte], sent: &s [byte], id: int) -> [] int {
+    if len(reply) < dns.header_size() || len(sent) < dns.header_size() {
+        return dropped_short();
+    }
+    if dns.u16_at(reply, 0) != id {
+        return dropped_id();
+    }
+    // QR set, opcode QUERY.
+    if int_of(reply[2]) < 128 || int_of(reply[2]) / 8 % 16 != 0 {
+        return dropped_not_response();
+    }
+    if dns.u16_at(reply, 4) != 1 {
+        return dropped_question();
+    }
+    let reply_name = dns.name_end(reply, dns.header_size());
+    let sent_name = dns.name_end(sent, dns.header_size());
+    if reply_name < 0 || sent_name < 0 || reply_name + 4 > len(reply) || sent_name + 4 > len(sent) || reply_name != sent_name {
+        return dropped_question();
+    }
+    let end = sent_name + 4;
+    var exact = true;
+    var folded = true;
+    var i = dns.header_size();
+    while i < end {
+        let a = int_of(reply[i]);
+        let b = int_of(sent[i]);
+        if a != b {
+            exact = false;
+            if i >= sent_name || dns.fold(a) != dns.fold(b) {
+                folded = false;
+            }
+        }
+        i = i + 1;
+    }
+    if exact {
+        return accepted();
+    }
+    if folded {
+        return dropped_case();
+    }
+    return dropped_question();
+}

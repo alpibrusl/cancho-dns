@@ -1,0 +1,125 @@
+import std.test;
+import dns;
+import rng;
+import forward;
+
+// The matching rule of `src/forward.cho` against each way a reply can be wrong, and the case randomiser.
+
+fn put_name[&b, &f](buf: &!b [byte], at: int, first: &f [byte]) -> [] int {
+    var p = dns.put8(buf, at, len(first));
+    var i = 0;
+    while i < len(first) {
+        p = dns.put8(buf, p, int_of(first[i]));
+        i = i + 1;
+    }
+    p = dns.put8(buf, p, 7);
+    let tail = "example";
+    i = 0;
+    while i < 7 {
+        p = dns.put8(buf, p, int_of(tail[i]));
+        i = i + 1;
+    }
+    return dns.put8(buf, p, 0);
+}
+
+// A message of `flags`, `id`, `qd` questions, the question `<first>.example` of `qtype`; answers its length.
+fn message[&b, &f](buf: &!b [byte], id: int, flags: int, qd: int, first: &f [byte], qtype: int) -> [] int {
+    var p = dns.put16(buf, 0, id);
+    p = dns.put16(buf, p, flags);
+    p = dns.put16(buf, p, qd);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = put_name(buf, p, first);
+    p = dns.put16(buf, p, qtype);
+    return dns.put16(buf, p, 1);
+}
+
+fn test_only_a_reply_that_repeats_the_question_exactly_is_accepted() -> [] int {
+    region g {
+        let sent = alloc_slice[g](128, byte_of(0));
+        let reply = alloc_slice[g](128, byte_of(0));
+        let sn = message(sent, 4660, 256, 1, "AbC", 1);
+        // The right reply.
+        var rn = message(reply, 4660, 33152, 1, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.accepted());
+        // Wrong id.
+        rn = message(reply, 4661, 33152, 1, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_id());
+        // QR clear (a query, not a response).
+        rn = message(reply, 4660, 256, 1, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_not_response());
+        // A response, but with an opcode other than QUERY.
+        rn = message(reply, 4660, 33152 + 2048, 1, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_not_response());
+        // The name in another case: the 0x20 mismatch.
+        rn = message(reply, 4660, 33152, 1, "abc", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_case());
+        rn = message(reply, 4660, 33152, 1, "ABC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_case());
+        // Another name altogether, and another name of the same length.
+        rn = message(reply, 4660, 33152, 1, "AbD", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_question());
+        rn = message(reply, 4660, 33152, 1, "AbCd", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_question());
+        // Another type.
+        rn = message(reply, 4660, 33152, 1, "AbC", 28);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_question());
+        // No question, two questions.
+        rn = message(reply, 4660, 33152, 0, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_question());
+        rn = message(reply, 4660, 33152, 2, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn], sent[0..sn], 4660), forward.dropped_question());
+        // Too short to be a message, and a question cut off.
+        test.assert_eq(forward.judge(reply[0..7], sent[0..sn], 4660), forward.dropped_short());
+        rn = message(reply, 4660, 33152, 1, "AbC", 1);
+        test.assert_eq(forward.judge(reply[0..rn - 3], sent[0..sn], 4660), forward.dropped_question());
+    }
+    return 0;
+}
+
+fn test_a_reply_may_carry_what_follows_the_question() -> [] int {
+    region g {
+        let sent = alloc_slice[g](128, byte_of(0));
+        let reply = alloc_slice[g](128, byte_of(0));
+        let sn = message(sent, 7, 256, 1, "x", 1);
+        var rn = message(reply, 7, 33152, 1, "x", 1);
+        // Bytes after the question (answers, an OPT) are the cache's to judge, not this rule's.
+        reply[rn] = byte_of(1);
+        reply[rn + 1] = byte_of(2);
+        test.assert_eq(forward.judge(reply[0..rn + 2], sent[0..sn], 7), forward.accepted());
+    }
+    return 0;
+}
+
+fn test_the_case_randomiser_changes_only_letters_and_changes_some[&h](heap: &!h Heap) -> [heap] int {
+    region g {
+        let seed = alloc_slice[g](32, byte_of(9));
+        var r = rng.open(heap, seed);
+        let name = alloc_slice[g](40, byte_of(0));
+        let copy = alloc_slice[g](40, byte_of(0));
+        let n = put_name(name, 0, "web-2go");
+        borrow mut r as &!w in {
+            var changed_total = 0;
+            var round = 0;
+            while round < 200 {
+                var i = 0;
+                while i < n {
+                    copy[i] = name[i];
+                    i = i + 1;
+                }
+                changed_total = changed_total + forward.randomize_case(w, copy[0..n]);
+                // Same length, equal when case is ignored; the length bytes and the dots' places and `-` and `2` untouched.
+                test.assert(dns.names_equal(name[0..n], copy[0..n]));
+                test.assert_eq(int_of(copy[0]), 7);
+                test.assert_eq(int_of(copy[4]), int_of(name[4]));
+                test.assert_eq(int_of(copy[5]), int_of(name[5]));
+                round = round + 1;
+            }
+            // 11 letters, each flipped half the time: about 1,100 changes in 200 rounds.
+            test.assert(changed_total > 900 && changed_total < 1300);
+        }
+        rng.close(heap, r);
+    }
+    return 0;
+}
