@@ -58,7 +58,7 @@ pub fn open[&h](heap: &!h Heap, memory: int, max_keys: int, seed: int, min_ttl: 
         l[3] = 3600;
         l[4] = 5;
     }
-    return Cache { store: store.open(heap, memory, max_keys, seed, store.evict_lru()), key: box_slice(heap, key_max(), byte_of(0)), value: box_slice(heap, prefix() + entry_max(), byte_of(0)), cur: box_slice(heap, 256, byte_of(0)), tmp: box_slice(heap, 256, byte_of(0)), limits: limits, counts: box_slice(heap, 16, 0) };
+    return Cache { store: store.open(heap, memory, max_keys, seed, store.evict_lru()), key: box_slice(heap, key_max(), byte_of(0)), value: box_slice(heap, prefix() + entry_max(), byte_of(0)), cur: box_slice(heap, 256, byte_of(0)), tmp: box_slice(heap, 256, byte_of(0)), limits: limits, counts: box_slice(heap, 17, 0) };
 }
 
 pub fn close[&h](heap: &!h Heap, c: Cache) -> [heap] int {
@@ -558,6 +558,7 @@ pub fn stats_reply[&c, &q, &t, &o](cache: &c Cache, query: &q [byte], table: &t 
     p = put_stat(out, p, "drop_parse", contents(cache.counts)[13]);
     p = put_stat(out, p, "acl_refused", contents(cache.counts)[14]);
     p = put_stat(out, p, "rrl_dropped", contents(cache.counts)[15]);
+    p = put_stat(out, p, "local_answered", contents(cache.counts)[16]);
     p = put_stat(out, p, "hits", hits(cache));
     p = put_stat(out, p, "misses", misses(cache));
     p = put_stat(out, p, "stored", stored(cache));
