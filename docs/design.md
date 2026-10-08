@@ -529,7 +529,7 @@ Not done in D4, said so.
 
 ## 18. D6, agent-friendly operation: the toolbox contract applied to a resolver
 
-*Status: design; gates fixed now, code next.* Task [#10](https://github.com/alpibrusl/cancho-dns/issues/10): the resolver must be as easy for an agent or a script to operate, inspect and debug as cancho-tools' tools. The model is [cancho-tools](https://github.com/alpibrusl/cancho-tools): `contract/rules.cho` (one catalogue, read by the code that exits and by `introspect`), `contract/describe.cho` (`introspect` and `skill` from the same tables), `contract/fail.cho` (errors as `{code, rule, message, hint, repair, detail}`), `scripts/manifest.py` (the authority report embedded by the build, at a fixed point).
+*Status: built (section 18.1).* Task [#10](https://github.com/alpibrusl/cancho-dns/issues/10): the resolver must be as easy for an agent or a script to operate, inspect and debug as cancho-tools' tools. The model is [cancho-tools](https://github.com/alpibrusl/cancho-tools): `contract/rules.cho` (one catalogue, read by the code that exits and by `introspect`), `contract/describe.cho` (`introspect` and `skill` from the same tables), `contract/fail.cho` (errors as `{code, rule, message, hint, repair, detail}`), `scripts/manifest.py` (the authority report embedded by the build, at a fixed point).
 
 **What does not carry over to a server.** Said first, because the issue asks:
 
@@ -551,7 +551,7 @@ Not done in D4, said so.
 
 * `dns check` prints the resolved configuration and the authority report the running server would have, and changes nothing (no bind, no listen; the gate is trace-based as cancho-tools' dry-run gate: run under `strace` and assert no `socket`/`bind`/`listen` call).
 * `dns explain NAME TYPE` says, without sending anything: which local directive matches (its kind, file-line of the config it came from, and the answer it would give), else whether the cache would answer (it cannot say without state; it says so), else which upstream would be asked (the selection order), and what the reply's shape would be. `explain` names the *policy*: the TTL clamps, the 0x20 and port randomisation, the defences.
-* `dns diff OLD NEW` says what changed between two configuration directories: upstreams added and removed, access-list prefixes added and removed, local directives added and removed, and the authority delta (a new upstream is a visible change: the `net_out` bound is unchanged `""`, so the delta is what `introspect` prints, not what the compiler can prove).
+* `dns diff OLD NEW` says what changed between two configuration files: upstreams added and removed, access-list prefixes added and removed, local directives added and removed. **Both must live under `conf/`** (a run-time path cannot narrow a capability, and a whole-filesystem `fs_read("")` is what refusing that costs: the file is read through `Fs("conf/")`, a literal, so the row gains exactly `fs_read("conf/")` and nothing else -- a visible change, made for the operator's loop, recorded here with the reason). The authority delta is what `introspect` prints, not what the compiler can prove (a new upstream does not move the `net_out("")` bound; section 2 said why).
 * Byte-stable outputs: the same binary and configuration print byte-identical answers (a gate runs each command twice and diffs).
 
 **Gates, fixed now.**
@@ -563,6 +563,26 @@ Not done in D4, said so.
 22. *Authority*: the ceiling gains nothing: `introspect`'s embedded report is the compiler's own answer at a fixed point (a string constant adds no label), and the gate diffing the ceiling stays green.
 
 What this does not do: the MCP front (optional in the issue; a separate slice once the CLI contract is real), the admin listener, reload-without-restart, and `explain` of cache state (a cache is state, and `explain` is stateless by construction).
+
+### 18.1 Built and measured
+
+`src/rules.cho` (the catalogue: 22 tags, each with its exit code, RCODE, counter and repairability), `src/cli.cho` (`introspect`, `skill`, `check`, `explain`, `diff`, the error shape, the byte-stable printing), and the dispatch in `src/server.cho`: before anything is bound, `arg(1)` names a subcommand and the binary answers and exits.
+
+* `introspect` prints one JSON object: the version, the compiler pin, the summary, the limits with defaults and ceilings, the compiled-in upstreams, every rule with its exit code or RCODE and counter, and the guarantees. The authority report is a placeholder until the manifest script (cancho-tools' pattern, pass 1 derive / embed / pass 2 fixed point) is a slice of its own.
+* `check` prints the resolved configuration: the upstreams, the access list, the local directive count, the authority.
+* `explain NAME TYPE` opens the local table, matches, and names the directive's kind (record, override, block, block-address) and that the answer is never cached and never forwarded; says of the cache that it is state and `explain` stateless; names the first upstream and the policy (TTL clamps, 0x20, ports, truncation).
+* `diff OLD NEW` reads two files under `conf/` and prints each configuration's directives (a line absent from the other file is the change). **The authority row gains `fs_read("conf/")` and `io_write`**, both visible changes, recorded here: `narrow(fs, "/dev/urandom", "conf/")` answers both capabilities, a run-time path cannot narrow, and the operator's loop is what the gain buys.
+* *Gate 18* (`tests/agent_test.py`): `introspect` is one JSON object; every rule has a tag, a summary and a repairability; the run-time tags name the counters `stats.bind` reports.
+* *Gate 20*: `check`, `explain` and `introspect` exit at once (no `listening` on stderr), `explain` names the directive that would answer, `diff` reads only under `conf/`.
+* *Gate 21*: every command run twice, byte-identical.
+* *Gate 22*: the authority ceiling (`authority/server.ceiling`) gains exactly `fs_read("conf/")` and `io_write`, and the gate stays green.
+* **A bug the building found**: the first `diff` held two 64 KiB region slices at once and trapped reading the second file; one region at a time fixed it. And `json.put_fragment` traps on an empty string, so an authority report that is not embedded is printed as `null`, not crashed on.
+
+Not done in D6, said so.
+* The authority report in `introspect` is a placeholder; the manifest script (derive, embed, derive again at a fixed point) is a slice of its own, on the cancho-tools pattern.
+* The schema (`schemas/dns.v1.json`) is not published yet; the gates check the shape, not a schema file.
+* `diff` compares whole lines; a rename of a record is an add and a remove, which is honest but coarse.
+* The MCP front, the admin listener, `/readyz`, and errors as data on the startup path (the argument validation still exits with a bare code) are not in this slice.
 
 ## Reproduce (section 2)
 

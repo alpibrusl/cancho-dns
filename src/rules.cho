@@ -1,0 +1,81 @@
+edition 5;
+
+module rules;
+
+import std.bytes;
+
+// `rules` -- the rule catalogue the resolver shares between the code that refuses and the description it prints
+// (`docs/design.md` section 18). The model is cancho-tools' `contract/rules.cho`: one table, so `introspect`'s rule
+// list and the refusals cannot disagree.
+//
+// A tag names the rule a reader would look up. The resolver has two audiences: the operator, at startup, to whom
+// an exit code means something; and a client, at run time, to whom an RCODE means something. Both are in the entry:
+// `tag|exit|rcode|counter|repairable|summary`, `;`-separated, fields `|`-separated. A startup refusal never has a
+// counter; a run-time refusal never has an exit code; the catalogue holds the ones that apply.
+//
+// The run-time tags the code already emits are here so `introspect` can list them with their counters: the codec's
+// refusals are answered FORMERR (`dns-*`), the access list REFUSED, the rate limiter silence.
+
+pub fn catalogue() -> [] &static [byte] {
+    return "args.bad-port|2|0||never|the port is not 1 to 65535;args.bad-idle|2|0||never|the idle timeout is not 1 to 86399 seconds;args.bad-min-ttl|2|0||never|the minimum TTL is not 1 to 3600 seconds;args.bad-memory|2|0||never|the cache arena is under 65536 bytes;args.bad-keys|2|0||never|the cache key cap is under 16;args.bad-rate|2|0||never|the response rate is negative;args.bad-burst|2|0||never|the burst is not 1 to 999999;args.unknown-flag|2|0||never|an argument this server does not take;dns-bad-header|0|1|drop_parse|never|a message too short to hold a header;dns-bad-counts|0|1|drop_parse|never|a message whose counts are not one question;dns-name-too-long|0|1|drop_parse|never|a name over 255 bytes;dns-label-too-long|0|1|drop_parse|never|a label over 63 bytes or of a retired kind;dns-bad-pointer|0|1|drop_parse|never|a compression pointer that does not point backwards;dns-truncated|0|1|drop_parse|never|a message cut off inside itself;dns-too-many-records|0|2|drop_parse|never|more records than the limits allow;dns-bad-edns|0|1|drop_parse|never|an OPT record misplaced or ill formed;dns-bad-rdata|0|2|drop_parse|never|record data that does not fit its type;dns-trailing-bytes|0|1|drop_parse|never|bytes after the last record;acl-refused|0|5|acl_refused|never|a client outside every allowed network;rrl-dropped|0|0|rrl_dropped|never|a client over its response rate;internal.no-entropy|1|0||never|the entropy source did not answer;internal.bind-failed|1|0||never|the port could not be bound";
+}
+
+pub fn count() -> [] int {
+    return bytes.count_byte(catalogue(), ';') + 1;
+}
+
+// Entry `i` (0-based), whole.
+pub fn entry(i: int) -> [] &static [byte] {
+    return bytes.field(catalogue(), ';', i + 1);
+}
+
+pub fn tag_of(i: int) -> [] &static [byte] {
+    return bytes.field(entry(i), '|', 1);
+}
+
+// The exit code a startup refusal with this tag exits with.
+pub fn exit_of(i: int) -> [] int {
+    return number_in(entry(i), 2);
+}
+
+// The RCODE a client is answered with at run time.
+pub fn rcode_of(i: int) -> [] int {
+    return number_in(entry(i), 3);
+}
+
+// The counter `stats.bind` reports this refusal under, or empty.
+pub fn counter_of(i: int) -> [] &static [byte] {
+    return bytes.field(entry(i), '|', 4);
+}
+
+pub fn repairable_of(i: int) -> [] &static [byte] {
+    return bytes.field(entry(i), '|', 5);
+}
+
+pub fn summary_of(i: int) -> [] &static [byte] {
+    return bytes.field(entry(i), '|', 6);
+}
+
+// The entry for `tag`, or -1. The one lookup the refusers and `introspect` share.
+pub fn find[&t](tag: &t [byte]) -> [] int {
+    var i = 0;
+    let n = count();
+    while i < n {
+        if bytes.equal(tag_of(i), tag) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn number_in(whole: &static [byte], field: int) -> [] int {
+    let text = bytes.field(whole, '|', field);
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        n = n * 10 + bytes.digit_of(int_of(text[k]));
+        k = k + 1;
+    }
+    return n;
+}

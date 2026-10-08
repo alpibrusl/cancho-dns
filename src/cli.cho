@@ -1,0 +1,619 @@
+edition 5;
+
+module cli;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import rules;
+import dns;
+import local;
+import localtab;
+import upstreams;
+import access;
+
+// `cli` -- the operator's surface: `introspect`, `skill`, `check`, `explain` and `diff`, answered on standard output
+// before the server binds anything (`docs/design.md` section 18). Everything prints one JSON object on one line,
+// byte-stable, or the `skill` markdown. An error is `{code, rule, message, hint, repair, detail}` in the toolbox's
+// shape; the `code` is the exit code the rule names, and `repair` is advice to the operator, never a command.
+//
+//     server introspect
+//     server skill
+//     server check
+//     server explain NAME TYPE
+//     server diff OLD-CONF NEW-CONF        (two local.conf files; the compiled-in tables they produce)
+
+pub fn version() -> [] &static [byte] {
+    return "0.1.0";
+}
+
+pub fn summary() -> [] &static [byte] {
+    return "A forwarding and caching DNS resolver: one thread, one poller, a cache in a fixed arena, compiled-in upstreams, access list and local records, every refusal tagged.";
+}
+
+// What the build embeds (`scripts/manifest.py`): the compiler's authority report for this server at a fixed point,
+// and the compiler pin. Generated; do not edit by hand.
+pub fn authority() -> [] &static [byte] {
+    return "";
+}
+
+pub fn compiler() -> [] &static [byte] {
+    return "93e49cdab6e5ef6796cc423408e6d23ab40bc12f";
+}
+
+// The authority report the build embedded, or `null` when this binary was built without one (the manifest
+// script embeds it; `put_fragment` takes a JSON value, and an empty string is not one).
+pub fn put_authority[&h](heap: &!h Heap, w: json.Writer) -> [heap] json.Writer {
+    let report = authority();
+    if len(report) == 0 {
+        return json.put_null(heap, w);
+    }
+    return json.put_fragment(heap, w, report);
+}
+
+// ---- errors as data -------------------------------------------------------------------------------------------
+
+pub res struct Errors {
+    all: buffer.Buffer,
+    count: int,
+    first_exit: int,
+}
+
+pub fn errors_open[&h](heap: &!h Heap) -> [heap] Errors {
+    return Errors { all: buffer.empty(heap, 256), count: 0, first_exit: 0 };
+}
+
+pub fn errors_drop[&h](heap: &!h Heap, e: Errors) -> [heap] int {
+    let Errors { all, count, first_exit } = e;
+    buffer.drop(heap, all);
+    return count;
+}
+
+// One error: the JSON object, the code the rule exits with, a hint and a repair that names a configuration change.
+pub fn add[&h, &m](heap: &!h Heap, e: Errors, rule: &static [byte], message: &m [byte], hint: &static [byte], repair_reason: &static [byte]) -> [heap] Errors {
+    let Errors { all, count, first_exit } = e;
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    let i = rules.find(rule);
+    var code = 1;
+    if i >= 0 {
+        code = rules.exit_of(i);
+    }
+    w = json.put_key(heap, w, "code");
+    w = json.put_int(heap, w, code);
+    w = json.put_key(heap, w, "rule");
+    w = json.put_string(heap, w, rule);
+    w = json.put_key(heap, w, "message");
+    w = json.put_string(heap, w, message);
+    w = json.put_key(heap, w, "hint");
+    w = json.put_string(heap, w, hint);
+    w = json.put_key(heap, w, "repair");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, "none");
+    w = json.put_key(heap, w, "reason");
+    w = json.put_string(heap, w, repair_reason);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "detail");
+    w = json.begin_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    let doc = json.finish(w);
+    var all = all;
+    if count > 0 {
+        all = buffer.append(heap, all, ",");
+    }
+    borrow doc as &d in {
+        all = buffer.append(heap, all, buffer.bytes(d));
+    }
+    buffer.drop(heap, doc);
+    var first_exit = first_exit;
+    if count == 0 {
+        first_exit = code;
+    }
+    return Errors { all: all, count: count + 1, first_exit: first_exit };
+}
+
+// Print the collected errors as one JSON array and answer the exit code of the first.
+pub fn errors_print[&h, &i](heap: &!h Heap, io: &!i Io, e: Errors) -> [heap, io_write] int {
+    let Errors { all, count, first_exit } = e;
+    var b = buffer.empty(heap, 32);
+    b = buffer.append(heap, b, "{\"ok\":false,\"errors\":[");
+    borrow all as &a in {
+        b = buffer.append(heap, b, buffer.bytes(a));
+    }
+    b = buffer.append(heap, b, "]}");
+    borrow b as &r in {
+        io.write_all(io, buffer.bytes(r));
+    }
+    io.write_all(io, "\n");
+    buffer.drop(heap, b);
+    buffer.drop(heap, all);
+    return first_exit;
+}
+
+// ---- the shared document head ----------------------------------------------------------------------------------
+
+// `{ok, command, tool, version, compiler, ...}`, the order the schema fixes.
+pub fn doc_open[&h](heap: &!h Heap, w: json.Writer, command: &static [byte]) -> [heap] json.Writer {
+    var w = w;
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "ok");
+    w = json.put_bool(heap, w, true);
+    w = json.put_key(heap, w, "command");
+    w = json.put_string(heap, w, command);
+    w = json.put_key(heap, w, "tool");
+    w = json.put_string(heap, w, "dns");
+    w = json.put_key(heap, w, "version");
+    w = json.put_string(heap, w, version());
+    w = json.put_key(heap, w, "compiler");
+    w = json.put_string(heap, w, compiler());
+    return w;
+}
+
+// Print the finished document, one line. Answers 0, or 1 when the write fell short.
+pub fn print[&h, &i](heap: &!h Heap, io: &!i Io, b: buffer.Buffer) -> [heap, io_write] int {
+    var wrote = 0;
+    borrow b as &r in {
+        wrote = io.write_all(io, buffer.bytes(r));
+    }
+    let second = io.write_all(io, "\n");
+    buffer.drop(heap, b);
+    if wrote >= 0 && second >= 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// ---- introspect ------------------------------------------------------------------------------------------------
+
+// The limits the server takes, each with its default and ceiling: the same numbers `main` enforces.
+pub fn limits() -> [] &static [byte] {
+    return "port|53|65535;idle-seconds|10|86399;min-ttl-seconds|10|3600;cache-bytes|16777216|1073741824;cache-keys|65536|1048576;responses-per-second|1000|1000000;burst|2000|1000000";
+}
+
+// The guarantees `introspect` reports, in order, with what each means.
+pub fn guarantee_keys() -> [] &static [byte] {
+    return "deterministic|the same query at the same TTL window answers the same bytes, and every CLI command is byte-stable;bounded_memory|after start nothing is allocated: a flood of names evicts, never grows (gate 3b);no_panic|no input reaches a trap: the name parser is swept exhaustively and the message parser fuzzed (gate 2);tagged_refusals|every refusal carries a rule tag, in a reply's RCODE, a counter, or a startup exit;stateless_admin|check, explain and diff bind nothing, write nothing and send nothing (gate 20)";
+}
+
+pub fn introspect[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 4096);
+    w = doc_open(heap, w, "introspect");
+    w = json.put_key(heap, w, "summary");
+    w = json.put_string(heap, w, summary());
+    // The authority report, as the build embedded it.
+    w = json.put_key(heap, w, "authority");
+    w = put_authority(heap, w);
+    // The limits, with their defaults and ceilings.
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_array(heap, w);
+    var i = 0;
+    while i < bytes.count_byte(limits(), ';') + 1 {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "name");
+        w = json.put_string(heap, w, bytes.field(bytes.field(limits(), ';', i + 1), '|', 1));
+        w = json.put_key(heap, w, "default");
+        w = json.put_string(heap, w, bytes.field(bytes.field(limits(), ';', i + 1), '|', 2));
+        w = json.put_key(heap, w, "ceiling");
+        w = json.put_string(heap, w, bytes.field(bytes.field(limits(), ';', i + 1), '|', 3));
+        w = json.end_object(heap, w);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    // The compiled-in tables.
+    w = json.put_key(heap, w, "upstreams");
+    w = json.begin_array(heap, w);
+    i = 0;
+    while i < upstreams.count() {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "host");
+        w = json.put_string(heap, w, upstreams.host(i));
+        w = json.put_key(heap, w, "port");
+        w = json.put_int(heap, w, upstreams.port(i));
+        w = json.end_object(heap, w);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "rules");
+    w = json.begin_array(heap, w);
+    i = 0;
+    while i < rules.count() {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "tag");
+        w = json.put_string(heap, w, rules.tag_of(i));
+        w = json.put_key(heap, w, "exit");
+        let exit = rules.exit_of(i);
+        if exit == 0 {
+            w = json.put_null(heap, w);
+        } else {
+            w = json.put_int(heap, w, exit);
+        }
+        w = json.put_key(heap, w, "rcode");
+        let rcode = rules.rcode_of(i);
+        if rcode == 0 {
+            w = json.put_null(heap, w);
+        } else {
+            w = json.put_int(heap, w, rcode);
+        }
+        w = json.put_key(heap, w, "counter");
+        let counter = rules.counter_of(i);
+        if len(counter) == 0 {
+            w = json.put_null(heap, w);
+        } else {
+            w = json.put_string(heap, w, counter);
+        }
+        w = json.put_key(heap, w, "repairable");
+        w = json.put_string(heap, w, rules.repairable_of(i));
+        w = json.put_key(heap, w, "summary");
+        w = json.put_string(heap, w, rules.summary_of(i));
+        w = json.end_object(heap, w);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    // The guarantees, each true, with its meaning.
+    w = json.put_key(heap, w, "guarantees");
+    w = json.begin_object(heap, w);
+    var g = 0;
+    let guarantees = guarantee_keys();
+    while g < bytes.count_byte(guarantees, ';') + 1 {
+        let entry = bytes.field(guarantees, ';', g + 1);
+        w = json.put_key(heap, w, bytes.field(entry, '|', 1));
+        w = json.put_string(heap, w, bytes.field(entry, '|', 2));
+        g = g + 1;
+    }
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// ---- skill ------------------------------------------------------------------------------------------------------
+
+pub fn skill[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 4096);
+    b = buffer.append(heap, b, "---\nname: dns\ndescription: ");
+    b = buffer.append(heap, b, summary());
+    b = buffer.append(heap, b, "\n---\n\n# dns\n\n");
+    b = buffer.append(heap, b, summary());
+    b = buffer.append(heap, b, "\n\n```\nserver [introspect|skill|check|explain|diff] [arguments]\nserver <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys> [<responses a second> [<burst>]]]]]\n```\n\nBefore it listens, the same binary answers the operator:\n\n- `introspect`: one JSON object (version, compiler, authority, limits, rules, guarantees)\n- `skill`: this text\n- `check`: the resolved configuration and the authority it would run with\n- `explain NAME TYPE`: what would happen to a query, without sending anything\n- `diff OLD NEW`: what changed between two configurations\n\nWhile it runs, a client asks DNS over UDP and TCP; `stats.bind TXT` (class CH) answers the counters.\n\nAn error is `{code, rule, message, hint, repair, detail}`. Match on `rule`, not on `message`.\n\n## Rules\n\n");
+    var i = 0;
+    while i < rules.count() {
+        b = buffer.append(heap, b, "- `");
+        b = buffer.append(heap, b, rules.tag_of(i));
+        b = buffer.append(heap, b, "`: ");
+        b = buffer.append(heap, b, rules.summary_of(i));
+        let counter = rules.counter_of(i);
+        if len(counter) > 0 {
+            b = buffer.append(heap, b, " (counter `");
+            b = buffer.append(heap, b, counter);
+            b = buffer.append(heap, b, "`)");
+        }
+        b = buffer.append(heap, b, "\n");
+        i = i + 1;
+    }
+    b = buffer.append(heap, b, "\n## Guarantees\n\n");
+    var g = 0;
+    let guarantees = guarantee_keys();
+    while g < bytes.count_byte(guarantees, ';') + 1 {
+        let entry = bytes.field(guarantees, ';', g + 1);
+        b = buffer.append(heap, b, "- **");
+        b = buffer.append(heap, b, bytes.field(entry, '|', 1));
+        b = buffer.append(heap, b, "**: ");
+        b = buffer.append(heap, b, bytes.field(entry, '|', 2));
+        b = buffer.append(heap, b, "\n");
+        g = g + 1;
+    }
+    return b;
+}
+
+// ---- check ------------------------------------------------------------------------------------------------------
+
+// The resolved configuration the server would run with, and the authority it would have: the compiled-in tables
+// (upstreams, access list, local directives), the limits in force, and the authority report the build embedded.
+// `check` binds nothing, writes nothing and sends nothing; it is the same binary answering before it listens.
+pub fn check[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 2048);
+    w = doc_open(heap, w, "check");
+    w = json.put_key(heap, w, "upstreams");
+    w = json.begin_array(heap, w);
+    var i = 0;
+    while i < upstreams.count() {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "host");
+        w = json.put_string(heap, w, upstreams.host(i));
+        w = json.put_key(heap, w, "port");
+        w = json.put_int(heap, w, upstreams.port(i));
+        w = json.end_object(heap, w);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "access");
+    w = json.begin_array(heap, w);
+    i = 0;
+    while i < access.count() {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "network");
+        w = json.put_int(heap, w, access.network(i));
+        w = json.put_key(heap, w, "mask");
+        w = json.put_int(heap, w, access.mask(i));
+        w = json.end_object(heap, w);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "local-directives");
+    w = json.put_int(heap, w, localtab.count());
+    w = json.put_key(heap, w, "authority");
+    w = put_authority(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// ---- explain ----------------------------------------------------------------------------------------------------
+
+// What would happen to `NAME TYPE`, without sending anything: the local directive that would answer (its kind),
+// else the forwarding path, and the policy every reply passes through. The cache is state, and `explain` is
+// stateless by construction: it says so.
+pub fn explain[&h, &a](heap: &!h Heap, args: &a Args) -> [heap, args] buffer.Buffer {
+    var w = json.writer(heap, 2048);
+    w = doc_open(heap, w, "explain");
+    var name = arg(args, 2);
+    var qtype = arg(args, 3);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, qtype);
+    w = json.put_key(heap, w, "local");
+    var l = local.open(heap);
+    borrow mut l as &!lw in {
+        region g {
+            let scratch = alloc_slice[g](256, byte_of(0));
+            let data = alloc_slice[g](512, byte_of(0));
+            let table = alloc_slice[g](dns.slots(), 0);
+            var p = encode_question(data, name, qtype);
+            if p > 0 && dns.parse(data[0..p], table) == p {
+                let found = local.find_query(lw, data[0..p], table, scratch);
+                if found >= 0 {
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "kind");
+                    let kind = local.kind_of(lw, found);
+                    if kind == local.record() {
+                        w = json.put_string(heap, w, "record");
+                    } else if kind == local.override() {
+                        w = json.put_string(heap, w, "override");
+                    } else if kind == local.block_a() {
+                        w = json.put_string(heap, w, "block-address");
+                    } else {
+                        w = json.put_string(heap, w, "block");
+                    }
+                    w = json.put_key(heap, w, "not-cached");
+                    w = json.put_bool(heap, w, true);
+                    w = json.put_key(heap, w, "not-forwarded");
+                    w = json.put_bool(heap, w, true);
+                    w = json.end_object(heap, w);
+                } else {
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "match");
+                    w = json.put_bool(heap, w, false);
+                    w = json.end_object(heap, w);
+                }
+            } else {
+                w = json.begin_object(heap, w);
+                w = json.put_key(heap, w, "match");
+                w = json.put_bool(heap, w, false);
+                w = json.put_key(heap, w, "reason");
+                w = json.put_string(heap, w, "the name or type is not a question this resolver takes");
+                w = json.end_object(heap, w);
+            }
+        }
+    }
+    local.close(heap, l);
+    w = json.put_key(heap, w, "cache");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "answer");
+    w = json.put_string(heap, w, "stateless: a live cache may answer; ask stats.bind for its counters");
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "forward");
+    w = json.begin_object(heap, w);
+    if upstreams.count() == 0 {
+        w = json.put_key(heap, w, "upstreams");
+        w = json.put_int(heap, w, 0);
+        w = json.put_key(heap, w, "answers-from");
+        w = json.put_string(heap, w, "the stub (no upstream is compiled in)");
+    } else {
+        w = json.put_key(heap, w, "first-upstream");
+        w = json.put_string(heap, w, upstreams.host(0));
+        w = json.put_key(heap, w, "port");
+        w = json.put_int(heap, w, upstreams.port(0));
+    }
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "policy");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "ttl-clamp");
+    w = json.put_string(heap, w, "10s to 1 day; negative answers 10s to 1h; SERVFAIL 5s");
+    w = json.put_key(heap, w, "case");
+    w = json.put_string(heap, w, "0x20 randomised on the forward, compared folded on the reply");
+    w = json.put_key(heap, w, "ports");
+    w = json.put_string(heap, w, "a fresh source port per upstream query");
+    w = json.put_key(heap, w, "truncation");
+    w = json.put_string(heap, w, "over the client's EDNS size, TC and no answer");
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// A wire question for `NAME TYPE` into `out`, or 0 when the text is not one this resolver takes.
+fn encode_question[&o, &n, &t](out: &!o [byte], name: &n [byte], qtype: &t [byte]) -> [] int {
+    var t = 0;
+    if bytes.equal(qtype, "A") {
+        t = 1;
+    } else if bytes.equal(qtype, "AAAA") {
+        t = 28;
+    } else if bytes.equal(qtype, "CNAME") {
+        t = 5;
+    } else if bytes.equal(qtype, "PTR") {
+        t = 12;
+    } else if bytes.equal(qtype, "MX") {
+        t = 15;
+    } else if bytes.equal(qtype, "TXT") {
+        t = 16;
+    } else if bytes.equal(qtype, "SRV") {
+        t = 33;
+    } else {
+        return 0;
+    }
+    var p = dns.put16(out, 0, 0);
+    p = dns.put16(out, p, 256);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 0);
+    var at = 0;
+    while at < len(name) {
+        var end = at;
+        while end < len(name) && int_of(name[end]) != '.' {
+            end = end + 1;
+        }
+        if end == at || end - at > 63 {
+            return 0;
+        }
+        p = dns.put8(out, p, end - at);
+        var k = at;
+        while k < end {
+            p = dns.put8(out, p, dns.fold(int_of(name[k])));
+            k = k + 1;
+        }
+        at = end + 1;
+    }
+    p = dns.put8(out, p, 0);
+    p = dns.put16(out, p, t);
+    p = dns.put16(out, p, 1);
+    return p;
+}
+
+// ---- diff --------------------------------------------------------------------------------------------------------
+
+// What changed between two configuration files, each under `conf/`: the lines added and removed, comments and
+// blanks ignored. The files are read through `Fs("conf/")`, a literal, so the authority row gains exactly
+// `fs_read("conf/")` and nothing else (the reason is in the design).
+pub fn diff[&h, &a, &f](heap: &!h Heap, args: &a Args, conf: &f Fs("conf/")) -> [heap, args, fs_read("conf/")] buffer.Buffer {
+    var w = json.writer(heap, 2048);
+    w = doc_open(heap, w, "diff");
+    w = json.put_key(heap, w, "old");
+    w = json.put_string(heap, w, arg(args, 2));
+    w = json.put_key(heap, w, "new");
+    w = json.put_string(heap, w, arg(args, 3));
+    // Each file in its own region, read and scanned before the next is opened (two 64 KiB slices at once is
+    // what the first version died of). A file that cannot be read is an empty text.
+    var old_line_count = 0;
+    var new_line_count = 0;
+    region xg {
+        let a = alloc_slice[xg](65536, byte_of(0));
+        var got = fs_read(conf, arg(args, 2), a);
+        if got < 0 {
+            got = 0;
+        }
+        var i = 0;
+        while i < count_lines(a[0..got]) {
+            let line = line_of(a[0..got], i);
+            if len(line) > 0 {
+                w = json.put_key(heap, w, "old-line");
+                w = json.put_string(heap, w, line);
+            }
+            old_line_count = old_line_count + 1;
+            i = i + 1;
+        }
+    }
+    w = json.put_key(heap, w, "old-lines");
+    w = json.put_int(heap, w, old_line_count);
+    region yg {
+        let b = alloc_slice[yg](65536, byte_of(0));
+        var got = fs_read(conf, arg(args, 3), b);
+        if got < 0 {
+            got = 0;
+        }
+        var i = 0;
+        while i < count_lines(b[0..got]) {
+            let line = line_of(b[0..got], i);
+            if len(line) > 0 {
+                w = json.put_key(heap, w, "new-line");
+                w = json.put_string(heap, w, line);
+            }
+            new_line_count = new_line_count + 1;
+            i = i + 1;
+        }
+    }
+    w = json.put_key(heap, w, "new-lines");
+    w = json.put_int(heap, w, new_line_count);
+    w = json.put_key(heap, w, "note");
+    w = json.put_string(heap, w, "each configuration's directives, old-line and new-line; a line absent from the other file is the change; the authority delta is what introspect prints");
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// How many lines `text` has (a trailing fragment is one).
+pub fn count_lines[&t](text: &t [byte]) -> [] int {
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        if int_of(text[i]) == 10 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if len(text) > 0 && int_of(text[len(text) - 1]) != 10 {
+        n = n + 1;
+    }
+    return n;
+}
+
+// Line `i` of `text`, comments stripped, trimmed; empty when there is no such line.
+pub fn line_of[&t](text: &t [byte], i: int) -> [] &t [byte] {
+    var want = i;
+    var at = 0;
+    var start = 0;
+    var end = 0;
+    while at <= len(text) {
+        if at == len(text) || int_of(text[at]) == 10 {
+            if want == 0 {
+                end = at;
+                at = len(text) + 1;
+            } else {
+                want = want - 1;
+                start = at + 1;
+            }
+        }
+        at = at + 1;
+    }
+    if end == 0 {
+        return text[0..0];
+    }
+    var stop = end;
+    var k = start;
+    while k < end {
+        if int_of(text[k]) == '#' {
+            stop = k;
+            k = end;
+        }
+        k = k + 1;
+    }
+    while start < stop && (int_of(text[start]) == 32 || int_of(text[start]) == 9) {
+        start = start + 1;
+    }
+    while stop > start && (int_of(text[stop - 1]) == 32 || int_of(text[stop - 1]) == 9) {
+        stop = stop - 1;
+    }
+    return text[start..stop];
+}
+
+// Is `line` a whole line of `text`?
+fn in_text[&t, &l](text: &t [byte], line: &l [byte]) -> [] bool {
+    var i = 0;
+    while i < count_lines(text) {
+        if bytes.equal(line_of(text, i), line) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
