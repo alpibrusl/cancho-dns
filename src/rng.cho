@@ -1,0 +1,105 @@
+edition 5;
+
+module rng;
+
+import std.chacha20;
+
+// `rng` -- the resolver's source of random numbers (`docs/design.md` section 15): transaction ids, the 0x20 case pattern, the choice
+// of upstream. The language has no randomness source (`docs/tls-pure.md`), so the program reads 32 bytes of `/dev/urandom` once at
+// start and this expands them: a ChaCha20 DRBG with **fast key erasure**. Each refill runs one block under the current key and counter
+// 0; the first 32 bytes of the block become the next key, the last 32 are the output. So the key that made an output is gone before the
+// output is used, and a later look at the state does not reveal what was drawn. One block (about 1 microsecond) per 32 bytes.
+
+pub res struct Rng {
+    key: Box[[byte]],
+    nonce: Box[[byte]],
+    block: Box[[byte]],
+    // 0: where the next output byte is in `block` (32..64), 1: refills so far.
+    state: Box[[int]],
+}
+
+// A generator seeded with the 32 bytes in `seed`.
+pub fn open[&h, &s](heap: &!h Heap, seed: &s [byte]) -> [heap] Rng {
+    var r = Rng { key: box_slice(heap, 32, byte_of(0)), nonce: box_slice(heap, 12, byte_of(0)), block: box_slice(heap, 64, byte_of(0)), state: box_slice(heap, 2, 0) };
+    borrow mut r as &!w in {
+        let key = contents(w.key);
+        var i = 0;
+        while i < 32 && i < len(seed) {
+            key[i] = seed[i];
+            i = i + 1;
+        }
+        contents(w.state)[0] = 64;
+    }
+    return r;
+}
+
+pub fn close[&h](heap: &!h Heap, r: Rng) -> [heap] int {
+    let Rng { key, nonce, block, state } = r;
+    var st = state;
+    var refills = 0;
+    borrow st as &s in {
+        refills = contents(s)[1];
+    }
+    unbox_slice(heap, key);
+    unbox_slice(heap, nonce);
+    unbox_slice(heap, block);
+    unbox_slice(heap, st);
+    return refills;
+}
+
+// How many blocks have been generated.
+pub fn refills[&r](rng: &r Rng) -> [] int {
+    return contents(rng.state)[1];
+}
+
+fn refill[&r](rng: &!r Rng) -> [] int {
+    let key = contents(rng.key);
+    let block = contents(rng.block);
+    let state = contents(rng.state);
+    chacha20.block(key, 0, contents(rng.nonce), block);
+    var i = 0;
+    while i < 32 {
+        key[i] = block[i];
+        block[i] = byte_of(0);
+        i = i + 1;
+    }
+    state[0] = 32;
+    state[1] = state[1] + 1;
+    return 0;
+}
+
+// One random byte, 0..255.
+pub fn byte[&r](rng: &!r Rng) -> [] int {
+    if contents(rng.state)[0] >= 64 {
+        refill(rng);
+    }
+    let state = contents(rng.state);
+    let v = int_of(contents(rng.block)[state[0]]);
+    state[0] = state[0] + 1;
+    return v;
+}
+
+// 16 random bits.
+pub fn u16[&r](rng: &!r Rng) -> [] int {
+    let a = byte(rng);
+    return a * 256 + byte(rng);
+}
+
+// 32 random bits.
+pub fn u32[&r](rng: &!r Rng) -> [] int {
+    let a = u16(rng);
+    return a * 65536 + u16(rng);
+}
+
+// A uniform number in `0..n` (n from 1 to 2^31), with no modulo bias: draws that fall in the uneven last stretch are thrown away.
+pub fn below[&r](rng: &!r Rng, n: int) -> [] int {
+    if n <= 1 {
+        return 0;
+    }
+    let limit = 4294967296 - 4294967296 % n;
+    var v = u32(rng);
+    while v >= limit {
+        v = u32(rng);
+    }
+    return v % n;
+}

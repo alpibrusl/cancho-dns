@@ -1,0 +1,154 @@
+import std.test;
+import std.chacha20;
+import rng;
+
+// The generator (`src/rng.cho`): its first output is the documented one, two seeds differ, the key moves on, and `below` is
+// uniform enough that a bug in it (a modulo bias, a stuck bit) would show.
+
+fn seed_a[&b](buf: &!b [byte]) -> [] int {
+    var i = 0;
+    while i < 32 {
+        buf[i] = byte_of(i + 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_the_first_output_is_the_second_half_of_the_first_block[&h](heap: &!h Heap) -> [heap] int {
+    region g {
+        let seed = alloc_slice[g](32, byte_of(0));
+        let nonce = alloc_slice[g](12, byte_of(0));
+        let block = alloc_slice[g](64, byte_of(0));
+        seed_a(seed);
+        test.assert_eq(chacha20.block(seed, 0, nonce, block), chacha20.ok());
+        var r = rng.open(heap, seed);
+        borrow mut r as &!w in {
+            var i = 0;
+            while i < 32 {
+                test.assert_eq(rng.byte(w), int_of(block[32 + i]));
+                i = i + 1;
+            }
+            test.assert_eq(rng.refills(w), 1);
+            // The 33rd byte needs a second block, under the key the first one made: its first 32 bytes.
+            let key2 = alloc_slice[g](32, byte_of(0));
+            i = 0;
+            while i < 32 {
+                key2[i] = block[i];
+                i = i + 1;
+            }
+            let block2 = alloc_slice[g](64, byte_of(0));
+            test.assert_eq(chacha20.block(key2, 0, nonce, block2), chacha20.ok());
+            test.assert_eq(rng.byte(w), int_of(block2[32]));
+            test.assert_eq(rng.refills(w), 2);
+        }
+        rng.close(heap, r);
+    }
+    return 0;
+}
+
+fn test_two_seeds_give_different_streams_and_one_seed_the_same[&h](heap: &!h Heap) -> [heap] int {
+    region g {
+        let s1 = alloc_slice[g](32, byte_of(0));
+        let s2 = alloc_slice[g](32, byte_of(0));
+        seed_a(s1);
+        seed_a(s2);
+        s2[31] = byte_of(99);
+        var a = rng.open(heap, s1);
+        var b = rng.open(heap, s2);
+        var c = rng.open(heap, s1);
+        var same_ab = 0;
+        var same_ac = 0;
+        borrow mut a as &!wa in {
+            borrow mut b as &!wb in {
+                borrow mut c as &!wc in {
+                    var i = 0;
+                    while i < 1000 {
+                        let x = rng.u32(wa);
+                        if x == rng.u32(wb) {
+                            same_ab = same_ab + 1;
+                        }
+                        if x == rng.u32(wc) {
+                            same_ac = same_ac + 1;
+                        }
+                        i = i + 1;
+                    }
+                }
+            }
+        }
+        test.assert_eq(same_ab, 0);
+        test.assert_eq(same_ac, 1000);
+        rng.close(heap, a);
+        rng.close(heap, b);
+        rng.close(heap, c);
+    }
+    return 0;
+}
+
+fn test_below_covers_its_range_evenly[&h](heap: &!h Heap) -> [heap] int {
+    region g {
+        let seed = alloc_slice[g](32, byte_of(0));
+        seed_a(seed);
+        var r = rng.open(heap, seed);
+        let three = alloc_slice[g](3, 0);
+        let seven = alloc_slice[g](7, 0);
+        let thousand = alloc_slice[g](1000, 0);
+        borrow mut r as &!w in {
+            var i = 0;
+            while i < 100000 {
+                let a = rng.below(w, 3);
+                three[a] = three[a] + 1;
+                let b = rng.below(w, 7);
+                seven[b] = seven[b] + 1;
+                let c = rng.below(w, 1000);
+                thousand[c] = thousand[c] + 1;
+                i = i + 1;
+            }
+        }
+        // Each bucket within 5% of its mean for 3 and 7 (about 33,333 and 14,285); within 30% for 1,000 (mean 100, so 70..130).
+        var k = 0;
+        while k < 3 {
+            test.assert(three[k] > 31666 && three[k] < 35000);
+            k = k + 1;
+        }
+        k = 0;
+        while k < 7 {
+            test.assert(seven[k] > 13571 && seven[k] < 15000);
+            k = k + 1;
+        }
+        k = 0;
+        while k < 1000 {
+            test.assert(thousand[k] > 60 && thousand[k] < 140);
+            k = k + 1;
+        }
+        rng.close(heap, r);
+    }
+    return 0;
+}
+
+fn test_every_bit_of_a_byte_is_set_about_half_the_time[&h](heap: &!h Heap) -> [heap] int {
+    region g {
+        let seed = alloc_slice[g](32, byte_of(0));
+        seed_a(seed);
+        var r = rng.open(heap, seed);
+        let ones = alloc_slice[g](8, 0);
+        borrow mut r as &!w in {
+            var i = 0;
+            while i < 20000 {
+                let v = rng.byte(w);
+                var b = 0;
+                while b < 8 {
+                    ones[b] = ones[b] + v / (1 << b) % 2;
+                    b = b + 1;
+                }
+                i = i + 1;
+            }
+        }
+        var b = 0;
+        while b < 8 {
+            test.assert(ones[b] > 9500 && ones[b] < 10500);
+            b = b + 1;
+        }
+        rng.close(heap, r);
+    }
+    return 0;
+}
