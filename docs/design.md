@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), and D3b, the access list and rate limiter (section 16), are built; the benchmark is not.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), and D3b, the access list and rate limiter (section 16), are built; D4, the local table (section 17), is designed; the benchmark is not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -474,6 +474,41 @@ Not done in D3b, said so.
 * The argument that a collision cannot be aimed at without the key is an argument; nothing here tests it.
 * IPv6, as everywhere.
 * The access list and the rate are start-up facts: a change is a rebuild or a restart, and `check`/`explain` (D4) do not exist yet to tell an operator what is in force.
+
+## 17. D4, local records, overrides and blocklists, design and gates before the code
+
+*Status: design; gates fixed now, code next.* Section 4 promised "local records and overrides from a small bounded file" (task [#8](https://github.com/alpibrusl/cancho-dns/issues/8)).
+The authority question was already answered in section 3 for the upstreams, and the same answer applies here: **the file is compiled in.** A run-time file would add an `fs_read` path to the authority row for no proof in exchange (section 3's own argument), so `local.conf` is turned into a `static` table by a generator (`tests/gen_local.py`, as `tests/gen_upstreams.py` and `tests/gen_access.py`), the build is one binary per deployment, and the answer never depends on a file at run time.
+
+**Format.** One directive per line; blank lines and `#` comments skipped. At most 512 directives, a name of at most 255 bytes, a value of at most 255 bytes, the file at most 64 KiB.
+
+* `record <name> <type> <value>` — answer `<type>` for `<name>` with `<value>` (TTL 30). Types: `A` (an IPv4 address), `AAAA` (an IPv6 address, carried as 16 bytes of data), `CNAME` (a name), `PTR` (a name), `TXT` (text, no spaces), `MX` (`<preference> <exchange>`), `SRV` (`<priority> <weight> <port> <target>`).
+* `override <name> <type> <value>` — as `record`, but the local answer wins even when the cache holds one, and the query is never forwarded.
+* `block <name>` — answer `NXDOMAIN` with the section-13 SOA, and never forward the query.
+* `block <name> <address>` — as `block`, but answer `NOERROR` with one `A` record of `<address>`.
+
+A name is a domain name with or without a trailing dot; matching is case-insensitive and a wildcard `*.` prefix matches any one label in its place. **Longest suffix wins; a tie is refused at generation** (two directives that match the same name and type: `gen_local.py` exits naming file and line — a config error, not a silent precedence). A `block` and a `record`/`override` that both match are the same tie, refused the same way. `override` beats `record` only because they never tie: an `override` and a `record` of the same name and type is a tie and refused.
+
+**Refusal at start.** Every bound is a generation-time refusal that names file and line (`local-too-many`, `local-name-too-long`, `local-value-too-long`, `local-bad-type`, `local-bad-value`, `local-tie`); the server never sees a bad table, so no input at run time can reach a panic through it. Generation is deterministic; CI regenerates `src/local.cho` from `local.conf` and diffs.
+
+**Matching and answering.** The generated table is one static byte string of directives, parsed once at start into a fixed arena (as the cache is): directive kind, name, type, value. A query that parses (opcode QUERY, class IN, one question) is matched **before the cache and before forwarding**:
+
+1. a `record` match answers from the table (TTL 30, at most the matched record's one answer) and is **not cached** (a local answer is a start-up fact; caching it would let a rebuild change nothing for up to a day);
+2. an `override` match answers the same way even on a cache hit;
+3. a `block` answers `NXDOMAIN` (or the fixed address) and is not forwarded;
+4. nothing matches: the query proceeds to the cache and the forwarder exactly as in D1–D3.
+
+PTR, MX, SRV and TXT answers are single-record; a `CNAME` answer carries the target as the record's data (no chase, v1). AAAA answers carry the 16 address bytes; the A of a `block <name> <address>` is one record. Replies keep the question, are bounded by `stub.udp_ceiling()`, and truncate exactly as the stub does when the client's UDP size demands it.
+
+**Gates, fixed now.**
+12. *Local answering* (`tests/local_test.py`, a server built with a table of records, overrides and blocks): each record type answered with the right wire bytes (checked by dnspython); a `record` not cached (a second ask with the upstream down still answers); an `override` served even after the same name was asked and answered from the upstream first; a `block` answered `NXDOMAIN` with the SOA and never sent upstream (the fake upstream asserts nothing arrived); a `block <name> <address>` answered with one `A`; a wildcard matched once and only once; a query that matches nothing forwarded as before; case-insensitive matching; the trailing dot optional. Mutants: matching off; matching after the cache; an `override` demoted to a `record`; a `block` forwarded anyway.
+13. *Differential matching* (`tests/differential_local.py`): a plain-Python reference (longest suffix, wildcard, tie = error) over a generated corpus of tables (up to 200 directives, every kind, wildcards at every depth) and queries (matched, unmatched, case variants, wildcard hits and misses): the server's answers equal the reference's on every query, and the reference refuses every generated tie that the generator refuses.
+14. *Bounds* (`tests/gen_local.py` refuses, checked by the same script's tests): each limit at and past its edge names file and line — 513 directives, a 256-byte name, a 256-byte value, a bad type, a bad value, a tie — and 512 directives, a 255-byte name and a 255-byte value are accepted.
+15. *Limiter unit tests* (`tests/local_test.cho`): the table parser and the matcher in isolation, every refusal, the wildcard, the tie refusal, the longest-suffix rule.
+16. *Authority*: the ceiling is unchanged (a generated table adds no capability).
+17. *The README* gains the format and the bounds, and says the local answers are TTL 30 and not cached.
+
+What this does not do: a local answer for a name that would otherwise be forwarded is only as good as the file (no DNSSEC, stage 2 may change that); reload without restart (a start-up fact, like the access list); more than one record per name and type (the tie rule forbids it); chasing a local `CNAME` to another local record (v1 answers the target as data).
 
 ## Reproduce (section 2)
 
