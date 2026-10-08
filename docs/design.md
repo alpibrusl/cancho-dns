@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), are built; the forwarder and the benchmark are not.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), are built; the benchmark is not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -383,7 +383,7 @@ Not done in D2, said so.
 
 ## 15. D3, the forwarder: design and gates, written before the code
 
-*Status: gates fixed, code not yet written. Corrected in place if a claim below turns out false.* The compiler is pinned at `alpibrusl/cancho@9dfc1ab`, which adds
+*Status: built (section 15.1). Corrected in place if a claim below turns out false.* The compiler is pinned at `alpibrusl/cancho@9dfc1ab`, which adds
 `udp_detach`/`udp_attach` and `std.udps` (cancho#370): section 5 asked for one connected socket per query in flight, and the language had no way to hold many sockets. That was
 found by reading this section's mechanism against the language before writing it.
 
@@ -415,6 +415,27 @@ so it is not discovered later.
 Also fixed now, for what the DRBG must show: `tests/rng_test.cho` pins its first block to `std.chacha20.block` for the same key, shows that two seeds give different streams, that the key changes after a refill, and that 100,000 draws of `below(n)` for n = 3, 7, 1000 land in every bucket with no bucket more than 5% from the mean.
 
 What D3 does not claim: that the upstream's answer is correct (there is no DNSSEC validation), that an on-path attacker is stopped (one who can see the query can match every field), or anything about TCP upstream or about IPv6.
+
+### 15.1 Built and measured
+
+`src/rng.cho` (the DRBG), `src/forward.cho` (the sans-io matching rule and the 0x20 randomiser), the pending table and socket table in `src/server.cho`, `src/upstreams.cho` (the compiled-in table; empty in the repository, in
+which case the server answers from the stub as in D1 and D2) and `tests/gen_upstreams.py`. `server` is started as before; the cache hash seed is now drawn from the DRBG at start (section 14.1 named it a weakness; it is closed).
+
+* *DRBG* (`tests/rng_test.cho`, 4 tests): the first output is the second half of the first ChaCha20 block of the seed and the next block is under the key the first made; two seeds differ and one seed repeats; `below(n)` for 3, 7 and 1,000 keeps every bucket of 100,000 draws within the stated band; every bit of a byte is set about half the time.
+* *Matching* (`tests/forward_test.cho`, 3 tests): accepted exactly when id, QR, opcode and the whole question (bytes) agree; each other case has its own code: id, QR, opcode, case only, another name, another type, no or two questions, too short, a cut-off question; bytes after the question do not matter to this rule. The randomiser changes only letters, keeps length bytes, and changes about half of them.
+* *Forwarding* (`tests/forward_server_test.py`, 9 tests against a fake upstream): a miss is forwarded and the next ask is a hit; the query carries RD, EDNS 1232 and a mixed-case name; a negative answer is forwarded and cached; a truncated upstream reply is TC to a UDP client and SERVFAIL to a TCP one and is not cached; 150 queries in flight at once are each answered to their own client in about the time of one; three pipelined TCP queries come back in order; a silent upstream gives SERVFAIL after two attempts (about 4 s), kept for 5 s, then answered at once, with the third timeout marking the upstream down so the next query takes one attempt and the one after sends nothing; a dropped first attempt is retried on a new socket with a new port and id; with one dead and one live upstream all 40 queries are answered and, once the dead one is marked down, it receives no more.
+* *Gate 4* (`tests/spoof_test.py`, 7 tests): forged replies of five classes (wrong id; right id and wrong case; another name; another type; QR clear) are each dropped, counted under their own tag only, never given to the client, never cached (the real answer is, with its real TTL, not the forged 3,000 s); with nothing real behind them the client gets SERVFAIL; an accepted reply carrying a planted answer for another name, glue and an NS is cached as the answer chain only (the planted names are misses afterwards and the NS is not there); a CNAME chain is kept; a perfect forgery from another socket never arrives and moves no counter (the kernel's work); a second copy of the real reply changes nothing; a perfect forgery after the timeout is not cached. **`tests/mutate_spoof.py`: 7 of 7 mutants killed** (id not compared; QR and opcode not checked; question compared without regard to case; name not compared; type and class not compared; no reply judged; chain filter off).
+* *Gate 5* (`tests/ports_test.py`), run here on Linux 6.18 in a Firecracker VM, 10,000 queries: **8,422 distinct ports, 8,420.9 expected from independent uniform draws (ratio 1.0001); range 32,768 to 60,996, all inside the kernel's ephemeral range; lag-1 serial correlation 0.0143; chi-square over 16 bins 13.14 (critical 37.7 at p = 0.001, df 15).** By the pre-registered reading the ports are not predictable. That is the range's 28,232 values, about 14.8 bits, not more; it is one kernel, and CI repeats the run on its own runner. Nothing is claimed for other kernels or for macOS, where this was not run.
+* *Memory* (`tests/forward_memory_test.py`): 100,000 distinct names, every one forwarded to the upstream: `VmRSS` 5,064 KiB after 80,000 and after 100,000 (0.00%), 97,952 evicted, `live` held at 2,048, and the process's open descriptors the same at the end as at the start (6): every query's socket is closed.
+* *Gate 6*: the ceiling gains exactly the two labels predicted, `net_out("")` and `fs_read("/dev/urandom")`.
+* *Closed from D2*: the store's hash seed (above), and the rdata of NS, PTR, DNAME, MX and SRV is now tested through the cache (the data comes back with its name written out).
+
+Not done in D3, said so.
+* **No upstream over TCP**, so a client that is sent TC by an upstream cannot be served the whole answer. No IPv6, no EDNS cookies, no DNSSEC.
+* **Response rate limiting and the client-prefix ACL of section 6 are not built.** The resolver answers anyone who can reach it, which is an open resolver.
+* **The pending table is searched linearly** for a free slot and for timeouts (every 100 ms, 1,024 entries): its cost under load is unmeasured and is a likely first thing the benchmark of section 8.1 shows.
+* Nothing here is a benchmark. The per-datagram cost of the socket table (two builtin calls and two table accesses per call) is not measured.
+* An on-path attacker who can see the query can match every field; this is the protection against one who cannot.
 
 ## Reproduce (section 2)
 

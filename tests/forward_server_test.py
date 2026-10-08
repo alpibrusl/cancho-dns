@@ -170,6 +170,18 @@ class Dead(Base):
         self.assertEqual(r.rcode(), 2); self.assertLess(time.time() - t0, 0.5)
         self.assertEqual(s.stats()["fwd_sent"], 2)
         self.assertEqual(self.up.count(), 2)
+        # Two timeouts so far. A third, on another name, marks the only upstream down for ten seconds, so there is no second attempt: the
+        # client waits one attempt (2 s) and not two. And then, with every upstream down, a miss is SERVFAIL at once and sends nothing.
+        t0 = time.time()
+        r = s.ask("silent-two.example.", timeout=10)
+        took = time.time() - t0
+        self.assertEqual(r.rcode(), 2)
+        self.assertGreater(took, 1.8); self.assertLess(took, 3.2)
+        self.assertEqual(self.up.count(), 3)
+        t0 = time.time()
+        r = s.ask("silent-three.example.", timeout=10)
+        self.assertEqual(r.rcode(), 2); self.assertLess(time.time() - t0, 0.5)
+        self.assertEqual(self.up.count(), 3)
 
 
 class Flaky(Base):

@@ -1,12 +1,14 @@
-# Gate 6 for the D1 server: the codec, stub and server together.
+# Gate 6 for the D3 server: codec, stub, cache, store, generator, matching and server together (docs/design.md sections 7 and 15).
 args
 clock
 conn_accept
 conn_read
 conn_write
 err_write
+fs_read("/dev/urandom")
 heap
 net_in("")
+net_out("")
 poll
 udp_recv
 udp_send

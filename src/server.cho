@@ -11,12 +11,15 @@ import forward;
 import upstreams;
 import std.udps;
 
-// `server` -- D1 of `docs/design.md`: UDP and TCP on one poller, answering from the stub (`src/stub.cho`) until there is a
-// cache and a forwarder.
+// `server` -- `docs/design.md` sections 13 to 15: UDP and TCP on one poller; an answer cache (`src/cache.cho`); and, when the compiled-in
+// table (`src/upstreams.cho`) names upstreams, a forwarder that sends each miss from a new connected socket (a new source port), with a
+// random id and a random case (`src/forward.cho`), and answers the client when the upstream does. With no upstream it answers from the
+// test stub (`src/stub.cho`) instead.
 //
 //     server <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys>]]]]     (10 seconds, 10 seconds, 16 MiB, 65,536 keys)
 //
-// One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection.
+// One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection, token `256 + i` the
+// socket of pending query `i`.
 //
 // **UDP.** Datagrams are read until the socket has none (at most 64 a turn, so a flood cannot starve the connections), each
 // answered at once with `udp_send_to` through the ticket `udp_recv_from` issued. A datagram that is a response is dropped; one that
@@ -874,7 +877,13 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
                 poller_add_udp(pw, sock, 1, 1);
             }
             let limit = max_connections();
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, 0, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rng.open(heap, seed), pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0) };
+            // The cache's hash seed is drawn at start, so a client that picks names cannot aim collisions at the index.
+            var rnd0 = rng.open(heap, seed);
+            var hash_seed = 0;
+            borrow mut rnd0 as &!rw in {
+                hash_seed = rng.u32(rw);
+            }
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0) };
             var tab = conns.empty(heap, 64);
             var socks = conns.empty(heap, 64);
             while true {
