@@ -9,7 +9,7 @@ env:
   # The compiler these sources are built and tested with: part of the contract, since a source file does not record
   # which `std` it was written against. This is the merge of alpibrusl/cancho#358 (the UDP sockets); it moves when
   # cancho-dns needs something newer, in a change that says why.
-  CANCHO_REV: 42dd86e418f882a76e4640cbd5017f7ad3f1feaf
+  CANCHO_REV: 93e49cdab6e5ef6796cc423408e6d23ab40bc12f
 
 jobs:
   test:
