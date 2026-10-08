@@ -437,6 +437,26 @@ Not done in D3, said so.
 * Nothing here is a benchmark. The per-datagram cost of the socket table (two builtin calls and two table accesses per call) is not measured.
 * An on-path attacker who can see the query can match every field; this is the protection against one who cannot.
 
+## 16. D3b, who may ask: the access list and the rate limiter, design and gates before the code
+
+*Status: gates fixed, code not yet written.* Section 15.1 ended with the resolver answering anyone who can reach it. Section 6 had a remedy on paper: a response-rate limiter per client /24 (4,096 buckets, 1,000 responses a second, burst 2,000) and a default that refuses clients outside configured prefixes. Both need the
+client's address, and the language did not give it: a bound socket answers through a ticket, and `Accepted` has no peer. Found by reading this section's mechanism against the language; built as cancho#376 (`udp_peer`, `conn_peer`, `conns.peer`), pinned from the commit that merges it.
+
+**Access list.** `access.conf` (`allow <ipv4>/<length>`, at most 16 lines) is compiled into `src/access.cho` by `tests/gen_access.py`, as the upstream table is. The repository's own file allows `127.0.0.0/8` and nothing else, so **the default is closed**: an operator opens it by listing the networks to serve.
+A UDP query from an address outside every prefix is answered `REFUSED` (small, the size of the query, so no amplification) and counted `acl_refused`; a TCP connection from one is closed at accept without a byte read, and counted the same. The check comes after the rate limiter, so a flood of refused queries is limited too.
+
+**Rate limiter.** Per client /24, a token bucket in 4,096 buckets chosen by a keyed hash (the key is drawn from the DRBG at start, so which networks share a bucket cannot be aimed at without it; **this is argued, not proven**). `rate` responses a second and a burst, both from the command line (defaults 1,000 and 2,000; a rate of 0 turns it off, and `explain` will say so).
+Buckets are shared on a collision, not reset: a deliberate collision can make a victim's network share an attacker's bucket, but cannot make the attacker's own traffic escape the limit. A UDP query over its bucket is dropped, not answered, and counted `rrl_dropped`. TCP is not limited by this: a TCP client has completed a handshake and so cannot be a spoofed source.
+
+**Gates, fixed now.**
+7. *Access* (`tests/access_test.py`, a server built with a table that allows `127.0.0.1/32` and `127.0.1.0/24`, clients bound to other loopback addresses): an allowed client is served over UDP and TCP; a client at `127.0.0.2` gets `REFUSED` over UDP and its TCP connection is closed unread; both counted; the same query from an allowed address afterwards is served (a refusal does not poison the cache or the limiter). Mutants: the check inverted; the check removed for UDP; removed for TCP; a prefix length ignored (`/32` taken as `/24`).
+8. *Rate* (`tests/rate_test.py`, rate 50 a second, burst 100): 2,000 queries sent as fast as possible from one address answer at most `burst + rate * seconds + 5` of them and at least `burst`; a second /24 asking at the same moment is answered in full; two hosts of one /24 share one bucket (together at most the same); after a pause of two seconds the bucket has refilled by about `2 * rate`; a rate of 0 answers all. Mutants: limiter off; bucket keyed by the full address rather than the /24; refill ignored; cost per response zero; burst ignored.
+9. *Limiter unit tests* (`tests/limit_test.cho`): the bucket arithmetic at its edges, with a fixed key and time.
+10. *Authority*: the ceiling does not change (`udp_peer` and `conn_peer` carry no label), and the diff in CI says so.
+11. *The README* says "closed by default" and what an open resolver is, and the limits above, nothing about abuse it was not measured against.
+
+What this does not do: stop a client inside an allowed prefix from sending many queries that each cost the upstream (the limiter is per /24 for responses, and a cache miss costs more than one); look at the content of the query; or defend against a spoofed source inside an allowed prefix (a datagram can name any source).
+
 ## Reproduce (section 2)
 
 ```
