@@ -13,10 +13,10 @@ here = os.path.dirname(os.path.abspath(__file__))
 CONF = "allow 127.0.0.1/32\nallow 127.0.1.0/24\n"
 # (file, old, new, what, which test judges it)
 MUTANTS = [
-    ("src/server.cho", "} else if peer < 0 || !access.allowed(address) {", "} else if peer < 0 || access.allowed(address) {", "the UDP check is inverted", "access"),
-    ("src/server.cho", "} else if peer < 0 || !access.allowed(address) {", "} else if false {", "the UDP check is removed", "access"),
-    ("src/server.cho", "if peer < 0 || !access.allowed(peer / 65536) {", "if false {", "the TCP check is removed", "access"),
-    ("src/server.cho", "if peer < 0 || !access.allowed(peer / 65536) {", "if peer < 0 || access.allowed(peer / 65536) {", "the TCP check is inverted", "access"),
+    ("src/server.cho", "} else if address < 0 || !access.allowed(address) {", "} else if address < 0 || access.allowed(address) {", "the UDP check is inverted", "access"),
+    ("src/server.cho", "} else if address < 0 || !access.allowed(address) {", "} else if false {", "the UDP check is removed", "access"),
+    ("src/server.cho", "                            if address < 0 || !access.allowed(address) {\n", "                            if false {\n", "the TCP check is removed", "access"),
+    ("src/server.cho", "                            if address < 0 || !access.allowed(address) {\n", "                            if address < 0 || access.allowed(address) {\n", "the TCP check is inverted", "access"),
     ("access.cho", "        if address & mask(i) == network(i) {", "        if address & 4294967040 == network(i) & 4294967040 {", "a prefix length is ignored (every prefix is a /24)", "access"),
     ("src/limit.cho", "    if p[0] <= 0 {\n        return true;\n    }", "    if true {\n        return true;\n    }", "the limiter is off", "rate"),
     ("src/limit.cho", "bucket_of(address / 256, p[2])", "bucket_of(address, p[2])", "buckets are keyed by the full address, not the /24", "rate"),
@@ -24,7 +24,7 @@ MUTANTS = [
     ("src/limit.cho", "    cells[b] = tokens - 1000;\n    return true;", "    cells[b] = tokens;\n    return true;", "a response costs nothing", "rate"),
     ("src/limit.cho", "            cells[2 * i] = burst * 1000;", "            cells[2 * i] = burst * 100000;", "the bucket starts far over the burst", "unit"),
     ("src/limit.cho", "        if tokens > p[1] * 1000 {\n            tokens = p[1] * 1000;\n        }", "", "the burst is not a ceiling", "rate"),
-    ("src/server.cho", "                if !limit.allow(core.limiter, address, now) {", "                if false && !limit.allow(core.limiter, address, now) {", "the server never asks the limiter", "rate"),
+    ("src/server.cho", "                if !limit.allow(core.limiter, network, now) {", "                if false && !limit.allow(core.limiter, network, now) {", "the server never asks the limiter", "rate"),
 ]
 killed = 0
 for path, old, new, why, which in MUTANTS:

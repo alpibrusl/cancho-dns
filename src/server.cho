@@ -12,6 +12,7 @@ import upstreams;
 import limit;
 import access;
 import std.udps;
+import std.addr;
 
 // `server` -- `docs/design.md` sections 13 to 15: UDP and TCP on one poller; an answer cache (`src/cache.cho`); and, when the compiled-in
 // table (`src/upstreams.cho`) names upstreams, a forwarder that sends each miss from a new connected socket (a new source port), with a
@@ -174,6 +175,8 @@ res struct Core {
     meta: Box[[int]],
     // Who may ask, and how fast (`docs/design.md` section 16).
     limiter: limit.Limiter,
+    // The 19 bytes `udp_peer` writes a sender into.
+    peerbuf: Box[[byte]],
 }
 
 // ---------------------------------------------------------------------
@@ -267,6 +270,27 @@ fn begin[&p, &q, &m, &d](pend: &!p [int], qbuf: &!q [byte], meta: &!m [int], dat
     return found;
 }
 
+// The IPv4 address, as a 32-bit number with the first octet highest, of a peer: -1 for anything else (an IPv6 peer, which no cancho
+// socket has yet, is not in any prefix of the access list and is not served).
+fn ipv4_of(p: addr.Peer) -> [] int {
+    if addr.family(p) == 4 {
+        return addr.word(p, 3);
+    }
+    return 0 - 1;
+}
+
+// The same for the 19 bytes `udp_peer` wrote, or -1.
+fn ipv4_in[&r](raw: &r [byte]) -> [] int {
+    match addr.decode(raw) {
+        addr.Parsed::Ok(p) => {
+            return ipv4_of(p);
+        }
+        addr.Parsed::Bad => {
+            return 0 - 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // UDP
 // ---------------------------------------------------------------------
@@ -286,15 +310,19 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
         match udp_recv_from(sock, dg, who) {
             Datagram::Got(n) => {
                 // Who is it? A ticket that does not name a sender is -1, which falls below every prefix.
-                let peer = udp_peer(sock, who[0]);
-                var address = 0;
-                if peer >= 0 {
-                    address = peer / 65536;
+                let pb = contents(core.peerbuf);
+                var address = 0 - 1;
+                if udp_peer(sock, who[0], pb) == 0 {
+                    address = ipv4_in(pb);
                 }
-                if !limit.allow(core.limiter, address, now) {
+                var network = 0;
+                if address >= 0 {
+                    network = address;
+                }
+                if !limit.allow(core.limiter, network, now) {
                     // Over its bucket: no answer at all, not even a refusal.
                     cache.note(core.answers, n_rate_dropped());
-                } else if peer < 0 || !access.allowed(address) {
+                } else if address < 0 || !access.allowed(address) {
                     cache.note(core.answers, n_acl_refused());
                     if !dns.is_response(dg[0..n]) && dns.parse(dg[0..n], tb) >= 0 {
                         let refusal = dns.encode_error(sc, dg[0..n], tb, 5, stub.udp_ceiling());
@@ -546,8 +574,15 @@ fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Liste
                         st[p + 4] = 1;
                         st[p + 5] = now;
                         borrow mut table as &!ct in {
-                            let peer = conns.peer(ct, slot);
-                            if peer < 0 || !access.allowed(peer / 65536) {
+                            var address = 0 - 1;
+                            match conns.peer(ct, slot) {
+                                conns.Peered::Known(p) => {
+                                    address = ipv4_of(p);
+                                }
+                                conns.Peered::Unavailable(e) => {
+                                }
+                            }
+                            if address < 0 || !access.allowed(address) {
                                 // Not a network this serves: closed without a byte read.
                                 cache.note(core.answers, n_acl_refused());
                                 shut(ct, core, slot);
@@ -922,7 +957,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
                 hash_seed = rng.u32(rw);
                 limit_key = rng.u32(rw);
             }
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), limiter: limit.open(heap, rate, burst, limit_key) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), limiter: limit.open(heap, rate, burst, limit_key), peerbuf: box_slice(heap, 19, byte_of(0)) };
             var tab = conns.empty(heap, 64);
             var socks = conns.empty(heap, 64);
             while true {
@@ -989,7 +1024,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             }
             conns.drop(heap, tab);
             udps.drop(heap, socks);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, limiter } = core;
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, limiter, peerbuf } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -1010,6 +1045,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             unbox_slice(heap, health);
             unbox_slice(heap, meta);
             limit.close(heap, limiter);
+            unbox_slice(heap, peerbuf);
             unbox_slice(heap, utable);
             return 0;
         }
