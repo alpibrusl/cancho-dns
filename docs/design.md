@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), are built; the forwarder and the benchmark are not.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), are built; the benchmark is not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -175,6 +175,31 @@ no ratio), as in cancho-cache.
 *Proposed* criterion: **at least 0.9 times Unbound** (one thread) in cells A, B and C, **no more than 0.5 times Unbound's resident memory** in
 cell D, and E reported, not gated. dnsmasq, CoreDNS, Knot Resolver and PowerDNS Recursor (BIND if cheap) are measured and reported with the same
 tables, not gated. A cell that misses is written up here, in place, with by how much. The baseline table is empty until it is measured.
+
+### 8.1 How the benchmark will be run, against whom, on which metrics (expanded 2026-10-07, before any number exists)
+
+**Against.** The gated comparison is **Unbound** (single thread, forwarding, cache on, DNSSEC validation off, prefetch off, rate limiting off), because it is the
+reference small-footprint caching resolver. Reported, not gated: **dnsmasq** (the other resolver most people run as a forwarder), **CoreDNS** with the `forward` and `cache`
+plugins, **Knot Resolver**, **PowerDNS Recursor**, and **BIND** if it can be set up cheaply. Every one is configured the same way: forward to the local stub authoritative, cache of the same
+size, no validation, no logging to disk, no rate limiting, one worker pinned to one core, and the configuration files published with the numbers. A resolver that cannot be put into that
+shape is reported with the difference named.
+
+**Tools.** `dnsperf` for fixed-duration throughput and latency, `resperf` for the highest rate each resolver sustains without losses (the number a capacity plan wants), and a
+local stub authoritative (a minimal one of our own, or NSD) that answers instantly so the upstream is never the limit. Load generator, resolver and stub run on separate cores of one
+machine whose model, kernel and governor are written down; five interleaved rounds, medians and the spread reported. Each cell is re-run with a wider client to rule out a
+client-bound result (the rule of section 8 stands).
+
+**Metrics.**
+1. *Throughput*: queries per second at a loss under 0.1% in cells A (UDP cache hit), B (miss forwarded), C (TCP hit, persistent connections). `resperf`'s sustained maximum is reported next to them.
+2. *Latency*: p50, p99 and p99.9 at half of each server's own maximum (cell E), and the same at a fixed shared rate that all of them can meet, which is the comparison that is fair to the slowest.
+3. *Memory*: resident set at start, after 100,000 distinct names cached (cell D), and after an hour of steady load, which is where a leak or fragmentation would show. Bytes per cached record is derived from it.
+4. *CPU per query*: CPU seconds divided by queries answered, at the shared rate, because throughput on one core is the inverse of it but it also shows idle cost.
+5. *Behaviour under stress, pass or fail and counted*: a cache-miss flood (distinct names, none repeated) next to a hot name that must keep being answered; an upstream that stops answering (time to `SERVFAIL`, whether other queries stall); a slow-loris TCP client set against the connection cap; a 1,000-connection burst.
+6. *Correctness during the run*: every reply checked against the stub's known answer (wrong, missing or late-after-timeout answers counted). A faster resolver that answers wrongly under load does not win a cell.
+7. *Footprint*: binary size, dependencies, time to start and to be ready, lines of source, and the authority report, which is the one thing here no competitor has.
+
+**What the numbers can and cannot say.** This is one core on one machine with a loopback upstream: it measures the resolver's own work per query and its memory, not Internet behaviour (round-trip times, loss, upstream selection). It is a single-thread
+comparison, so it does not speak for Unbound or CoreDNS at their usual multi-thread settings. The criterion of section 8 (0.9x Unbound in A, B, C and 0.5x its memory in D) is unchanged; a miss is written up in place with by how much.
 
 ## 9. Plan, each step with its own gate
 
@@ -355,6 +380,62 @@ Not done in D2, said so.
 * The "upstream" is the stub: no real answer has gone through `insert` yet, so the re-encoder is tested on constructed replies only (CNAME, A, TXT, SOA); NS, PTR,
   MX, SRV and DNAME rdata go through the same code path but have no test of their own.
 * No negative-cache aggressive use, no prefetch, no serve-stale; entry size is capped at 4,096 bytes (a larger answer is not cached).
+
+## 15. D3, the forwarder: design and gates, written before the code
+
+*Status: built (section 15.1). Corrected in place if a claim below turns out false.* The compiler is pinned at `alpibrusl/cancho@9dfc1ab`, which adds
+`udp_detach`/`udp_attach` and `std.udps` (cancho#370): section 5 asked for one connected socket per query in flight, and the language had no way to hold many sockets. That was
+found by reading this section's mechanism against the language before writing it.
+
+**Mechanism.** A cache miss takes a slot in a bounded pending table (1,024). For each attempt the resolver draws a 16-bit ID and a 0x20 case pattern from a ChaCha20 DRBG seeded from
+`/dev/urandom` (`src/rng.cho`; the key is replaced from the keystream after each refill, so a later state does not reveal earlier outputs), opens a **fresh connected socket**
+(`udp_connect`, so a kernel-chosen source port and a kernel that drops every other source), keeps it in a `std.udps` table, and sends the query with the name's letters in the pattern's case,
+`RD` set, and EDNS 1232. The socket is watched on the shared `Poller`. A reply is **accepted only if** it arrives on that socket; has QR set, opcode QUERY and the drawn ID; and its
+question section is **byte-identical** to the one sent (so the case, the type and the class all match, which is the 0x20 check and the question check in one comparison). Anything else is dropped and
+counted by rule tag (`dns-reply-id`, `dns-reply-question`, `dns-reply-not-response`). An accepted reply goes through `cache.insert` (section 6's answer-chain filter), and the client is served from the
+entry; a reply the cache will not keep is answered `SERVFAIL`. The socket is closed when the query ends, by answer, drop of the pending slot, or timeout.
+
+**Timeouts, retries, health.** An attempt times out after 2 s; a query gets two attempts, the second on a new socket, ID and case pattern, to the next healthy upstream; after the second, the client gets `SERVFAIL`, which the
+cache keeps for 5 s. An upstream with three consecutive timeouts is marked down for 10 s and skipped; if all are down the client gets `SERVFAIL` at once. A TCP client has one query in flight at a time (its next buffered message
+waits for the answer), so replies stay in order. A UDP reply from upstream with TC set is not cached and is passed to a UDP client as a truncated reply; to a TCP client it is `SERVFAIL`. **Upstream over TCP is not in D3**, said here
+so it is not discovered later.
+
+**The upstream table is compiled in** (section 3): `src/upstreams.cho` is generated by `tests/gen_upstreams.py` from `upstreams.conf` (`host port` per line, at most 8). The tests build with a table of their own pointing at a fake upstream on loopback.
+
+**Gates, fixed now.**
+4. *Poisoning resistance* (`tests/spoof_test.py`, with a fake upstream written to misbehave). Per forgery class, a forged reply is sent before the real one, or in place of it, and the test asserts that the client is never given the forgery, that the
+   cache holds only the real answer (a later ask for the name the forgery tried to plant is a miss, via `stats.bind.`), and that the drop counter for that class moved. Classes: wrong ID; right ID, wrong case (0x20); wrong question name; wrong question type; QR clear; right everything but with extra
+   records in the answer for another name (a CNAME to a planted name, an A for a name never asked) and in the additional section (glue); a reply from a different socket than the one the query went to (the kernel's job, asserted rather than assumed); a reply after the timeout; a
+   reply that duplicates one already accepted. **Each class is a mutant of the matching code** (`tests/mutate_spoof.py`: ID not compared; case-insensitive question comparison; type not compared; QR not checked; chain filter off; reply accepted after the pending slot is gone), and **each must be killed by this test**; a survivor is listed with the reason.
+5. *Source-port entropy*: 10,000 consecutive upstream queries are made and the fake upstream records each source port. Reported, whichever way it points: distinct count, minimum and maximum, the fraction in the kernel's ephemeral range, the lag-1 serial correlation of the sequence, and a chi-square over 16 equal bins. The README
+   claims nothing about source ports beyond that report. If the ports are predictable the project says so here and relies on 0x20 and the ID alone.
+   *Pre-registered reading*: a distinct count under 95% of the count expected for 10,000 independent draws from the range, or a lag-1 correlation over 0.05 in absolute value, is "predictable" and is written up as such.
+3b. *Memory*: the pending table, the socket table and the query copies are fixed at start; the flood test of section 14 is repeated with every query a miss that is forwarded, and RSS after 80,000 and 100,000 of them must agree within 1%.
+6. *Authority*: the ceiling gains `net_out("")` and `fs_read("/dev/urandom")` and nothing else.
+Also fixed now, for what the DRBG must show: `tests/rng_test.cho` pins its first block to `std.chacha20.block` for the same key, shows that two seeds give different streams, that the key changes after a refill, and that 100,000 draws of `below(n)` for n = 3, 7, 1000 land in every bucket with no bucket more than 5% from the mean.
+
+What D3 does not claim: that the upstream's answer is correct (there is no DNSSEC validation), that an on-path attacker is stopped (one who can see the query can match every field), or anything about TCP upstream or about IPv6.
+
+### 15.1 Built and measured
+
+`src/rng.cho` (the DRBG), `src/forward.cho` (the sans-io matching rule and the 0x20 randomiser), the pending table and socket table in `src/server.cho`, `src/upstreams.cho` (the compiled-in table; empty in the repository, in
+which case the server answers from the stub as in D1 and D2) and `tests/gen_upstreams.py`. `server` is started as before; the cache hash seed is now drawn from the DRBG at start (section 14.1 named it a weakness; it is closed).
+
+* *DRBG* (`tests/rng_test.cho`, 4 tests): the first output is the second half of the first ChaCha20 block of the seed and the next block is under the key the first made; two seeds differ and one seed repeats; `below(n)` for 3, 7 and 1,000 keeps every bucket of 100,000 draws within the stated band; every bit of a byte is set about half the time.
+* *Matching* (`tests/forward_test.cho`, 3 tests): accepted exactly when id, QR, opcode and the whole question (bytes) agree; each other case has its own code: id, QR, opcode, case only, another name, another type, no or two questions, too short, a cut-off question; bytes after the question do not matter to this rule. The randomiser changes only letters, keeps length bytes, and changes about half of them.
+* *Forwarding* (`tests/forward_server_test.py`, 9 tests against a fake upstream): a miss is forwarded and the next ask is a hit; the query carries RD, EDNS 1232 and a mixed-case name; a negative answer is forwarded and cached; a truncated upstream reply is TC to a UDP client and SERVFAIL to a TCP one and is not cached; 150 queries in flight at once are each answered to their own client in about the time of one; three pipelined TCP queries come back in order; a silent upstream gives SERVFAIL after two attempts (about 4 s), kept for 5 s, then answered at once, with the third timeout marking the upstream down so the next query takes one attempt and the one after sends nothing; a dropped first attempt is retried on a new socket with a new port and id; with one dead and one live upstream all 40 queries are answered and, once the dead one is marked down, it receives no more.
+* *Gate 4* (`tests/spoof_test.py`, 7 tests): forged replies of five classes (wrong id; right id and wrong case; another name; another type; QR clear) are each dropped, counted under their own tag only, never given to the client, never cached (the real answer is, with its real TTL, not the forged 3,000 s); with nothing real behind them the client gets SERVFAIL; an accepted reply carrying a planted answer for another name, glue and an NS is cached as the answer chain only (the planted names are misses afterwards and the NS is not there); a CNAME chain is kept; a perfect forgery from another socket never arrives and moves no counter (the kernel's work); a second copy of the real reply changes nothing; a perfect forgery after the timeout is not cached. **`tests/mutate_spoof.py`: 7 of 7 mutants killed** (id not compared; QR and opcode not checked; question compared without regard to case; name not compared; type and class not compared; no reply judged; chain filter off).
+* *Gate 5* (`tests/ports_test.py`), run here on Linux 6.18 in a Firecracker VM, 10,000 queries: **8,422 distinct ports, 8,420.9 expected from independent uniform draws (ratio 1.0001); range 32,768 to 60,996, all inside the kernel's ephemeral range; lag-1 serial correlation 0.0143; chi-square over 16 bins 13.14 (critical 37.7 at p = 0.001, df 15).** By the pre-registered reading the ports are not predictable. That is the range's 28,232 values, about 14.8 bits, not more; it is one kernel, and CI repeats the run on its own runner. Nothing is claimed for other kernels or for macOS, where this was not run.
+* *Memory* (`tests/forward_memory_test.py`): 100,000 distinct names, every one forwarded to the upstream: `VmRSS` 5,064 KiB after 80,000 and after 100,000 (0.00%), 97,952 evicted, `live` held at 2,048, and the process's open descriptors the same at the end as at the start (6): every query's socket is closed.
+* *Gate 6*: the ceiling gains exactly the two labels predicted, `net_out("")` and `fs_read("/dev/urandom")`.
+* *Closed from D2*: the store's hash seed (above), and the rdata of NS, PTR, DNAME, MX and SRV is now tested through the cache (the data comes back with its name written out).
+
+Not done in D3, said so.
+* **No upstream over TCP**, so a client that is sent TC by an upstream cannot be served the whole answer. No IPv6, no EDNS cookies, no DNSSEC.
+* **Response rate limiting and the client-prefix ACL of section 6 are not built.** The resolver answers anyone who can reach it, which is an open resolver.
+* **The pending table is searched linearly** for a free slot and for timeouts (every 100 ms, 1,024 entries): its cost under load is unmeasured and is a likely first thing the benchmark of section 8.1 shows.
+* Nothing here is a benchmark. The per-datagram cost of the socket table (two builtin calls and two table accesses per call) is not measured.
+* An on-path attacker who can see the query can match every field; this is the protection against one who cannot.
 
 ## Reproduce (section 2)
 

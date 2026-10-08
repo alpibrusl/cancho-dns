@@ -320,6 +320,60 @@ fn test_only_the_answer_chain_is_kept[&h](heap: &!h Heap) -> [heap] int {
     return 0;
 }
 
+// A reply to `a.example` of `qtype` whose one answer's data is `fixed` zero bytes and then a name that is a pointer to the question's
+// name. Cached, the data must come back with the name written out (the entry is position independent), and the whole must still parse.
+fn check_names_in_rdata[&h](heap: &!h Heap, qtype: int, fixed: int) -> [heap] int {
+    var c = cache.open(heap, 65536, 64, 0, 10);
+    borrow mut c as &!w in {
+        region g {
+            let q = alloc_slice[g](512, byte_of(0));
+            let r = alloc_slice[g](2048, byte_of(0));
+            let out = alloc_slice[g](4096, byte_of(0));
+            let qt = alloc_slice[g](dns.slots(), 0);
+            let rt = alloc_slice[g](dns.slots(), 0);
+            let ot = alloc_slice[g](dns.slots(), 0);
+            var qn = query_a(q);
+            dns.put16(q, 12 + 11, qtype);
+            test.assert_eq(dns.parse(q[0..qn], qt), qn);
+            var p = reply_head(r, 33152, 1, 0, 0, 'a');
+            dns.put16(r, 12 + 11, qtype);
+            p = put_name(r, p, 'a', 0);
+            p = dns.put16(r, p, qtype);
+            p = dns.put16(r, p, 1);
+            p = dns.put32(r, p, 300);
+            p = dns.put16(r, p, fixed + 2);
+            p = p + fixed;
+            p = dns.put16(r, p, 49164);
+            test.assert_eq(dns.parse(r[0..p], rt), p);
+            test.assert_eq(cache.insert(w, 0, q[0..qn], qt, r[0..p], rt), 0);
+            let n = cache.lookup(w, 1000, q[0..qn], qt, out, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], ot), n);
+            test.assert_eq(ot[3], 1);
+            // The data is the fixed part and the 11 bytes of `a.example`, no pointer left.
+            test.assert_eq(ot[14 + 5], fixed + 11);
+            let at = ot[14 + 4] + fixed;
+            test.assert_eq(int_of(out[at]), 1);
+            test.assert_eq(int_of(out[at + 1]), 'a');
+            test.assert_eq(int_of(out[at + 2]), 7);
+            test.assert_eq(int_of(out[at + 3]), 'e');
+            test.assert_eq(int_of(out[at + 9]), 'e');
+            test.assert_eq(int_of(out[at + 10]), 0);
+        }
+    }
+    cache.close(heap, c);
+    return 0;
+}
+
+fn test_names_inside_the_data_of_ns_ptr_dname_mx_and_srv_are_written_out[&h](heap: &!h Heap) -> [heap] int {
+    check_names_in_rdata(heap, 2, 0);
+    check_names_in_rdata(heap, 12, 0);
+    check_names_in_rdata(heap, 39, 0);
+    check_names_in_rdata(heap, 15, 2);
+    check_names_in_rdata(heap, 33, 6);
+    return 0;
+}
+
 fn put_soa[&b](buf: &!b [byte], at: int, ttl: int, minimum: int) -> [] int {
     var p = put_name(buf, at, 'z', 0);
     p = dns.put16(buf, p, 6);

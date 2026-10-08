@@ -6,13 +6,20 @@ import std.io;
 import dns;
 import stub;
 import cache;
+import rng;
+import forward;
+import upstreams;
+import std.udps;
 
-// `server` -- D1 of `docs/design.md`: UDP and TCP on one poller, answering from the stub (`src/stub.cho`) until there is a
-// cache and a forwarder.
+// `server` -- `docs/design.md` sections 13 to 15: UDP and TCP on one poller; an answer cache (`src/cache.cho`); and, when the compiled-in
+// table (`src/upstreams.cho`) names upstreams, a forwarder that sends each miss from a new connected socket (a new source port), with a
+// random id and a random case (`src/forward.cho`), and answers the client when the upstream does. With no upstream it answers from the
+// test stub (`src/stub.cho`) instead.
 //
 //     server <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys>]]]]     (10 seconds, 10 seconds, 16 MiB, 65,536 keys)
 //
-// One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection.
+// One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection, token `256 + i` the
+// socket of pending query `i`.
 //
 // **UDP.** Datagrams are read until the socket has none (at most 64 a turn, so a flood cannot starve the connections), each
 // answered at once with `udp_send_to` through the ticket `udp_recv_from` issued. A datagram that is a response is dropped; one that
@@ -61,6 +68,69 @@ fn stride() -> [] int {
     return 8;
 }
 
+// Per connection `k`, `state[8k + 6]` is the pending query it waits for plus one (0: none), and `state[8k + 7]` counts the
+// connections that have used the slot, so a reply meant for a connection that has closed does not reach the next one in its slot.
+
+fn max_pending() -> [] int {
+    return 1024;
+}
+
+// Per pending query `i`, `pend[12i..12i+12]` is:
+//
+//     0  state: 0 free, 1 sent and waiting, 2 to be sent (or sent again)
+//     1  the client: 0 a datagram, 1 a TCP connection
+//     2  the client's ticket, or its connection's slot
+//     3  the id the query went upstream with
+//     4  when this attempt times out, in milliseconds
+//     5  attempts made
+//     6  the upstream it went to
+//     7  the length of the client's query, kept in `qbuf[qmax() * i ..]`
+//     8  its socket's slot in the socket table
+//     9  the length of the query as sent, kept in `sbuf[smax() * i ..]`
+//    10  the generation of the client's connection (TCP)
+//    11  the upstream to avoid on the next attempt, or -1
+fn pstride() -> [] int {
+    return 12;
+}
+
+fn qmax() -> [] int {
+    return 600;
+}
+
+fn smax() -> [] int {
+    return 320;
+}
+
+// How long an attempt waits, how long an upstream that failed three times in a row is left alone, and the first token of the sockets.
+fn attempt_ms() -> [] int {
+    return 2000;
+}
+
+fn down_ms() -> [] int {
+    return 10000;
+}
+
+fn up_token() -> [] int {
+    return 256;
+}
+
+// The counters `cache.note` keeps for the forwarder.
+fn n_sent() -> [] int {
+    return 0;
+}
+
+fn n_timeout() -> [] int {
+    return 1;
+}
+
+fn n_servfail() -> [] int {
+    return 2;
+}
+
+fn n_drop_parse() -> [] int {
+    return 8;
+}
+
 res struct Core {
     poller: Poller,
     // `poller_wait` fills these with (token, readiness) pairs.
@@ -80,17 +150,28 @@ res struct Core {
     answers: cache.Cache,
     upstream: Box[[byte]],
     utable: Box[[int]],
+    // Forwarding (D3, `docs/design.md` section 15): the generator, the pending queries (see `pstride`), the client query kept for each,
+    // the query as it went upstream, a name being built, a reply being read, each upstream's health (consecutive failures, down until)
+    // and a few counters of the table (`meta`: 0 when the timeouts were last looked at, 1 queries waiting to be sent, 2 in use).
+    rnd: rng.Rng,
+    pend: Box[[int]],
+    qbuf: Box[[byte]],
+    sbuf: Box[[byte]],
+    nbuf: Box[[byte]],
+    rbuf: Box[[byte]],
+    health: Box[[int]],
+    meta: Box[[int]],
 }
 
 // ---------------------------------------------------------------------
 // One message in, one reply out
 // ---------------------------------------------------------------------
 
-// Answer the message `data` into `out`: its length, or 0 for none (a response, or nothing to say). `udp` holds the reply to the size
+// Answer the message `data` into `out`: its length, or 0 for none (a response, or nothing to say), or -1 if it has to go upstream. `udp` holds the reply to the size
 // the client can take; TCP does not. A question the resolver can answer is looked up in the cache first; on a miss the stub (the
 // upstream, until there is a forwarder) answers into `up`, the reply goes through `cache.insert` exactly as a forwarded one will, and
 // the client is served from the entry; a reply that is not cacheable (a refusal, no SOA) is sent as it is.
-fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int) -> [] int {
+fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int, forwarding: bool) -> [] int {
     if dns.is_response(data) {
         return 0;
     }
@@ -110,6 +191,10 @@ fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [b
         if hit > 0 {
             return hit;
         }
+        if forwarding {
+            // A miss with an upstream: the caller queues the query and the answer comes when the upstream's does.
+            return 0 - 1;
+        }
         let used = stub.respond(up, data, table, 0);
         if used > 0 && dns.parse(up[0..used], ut) == used {
             if cache.insert(answers, now, data, table, up[0..used], ut) == 0 {
@@ -126,6 +211,47 @@ fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [b
         return dns.encode_error(out, data, table, 2, stub.udp_ceiling());
     }
     return n;
+}
+
+// Take a slot in the pending table for a query that has to go upstream, keeping a copy of it. `kind` and `client` say who is
+// waiting (a datagram's ticket, or a TCP connection's slot with its `generation`). Answers the index, or -1 if the table is full or
+// the query is longer than is kept; the caller then answers SERVFAIL itself.
+fn begin[&p, &q, &m, &d](pend: &!p [int], qbuf: &!q [byte], meta: &!m [int], data: &d [byte], kind: int, client: int, generation: int) -> [] int {
+    if len(data) > qmax() {
+        return 0 - 1;
+    }
+    var i = 0;
+    var found = 0 - 1;
+    while i < max_pending() && found < 0 {
+        if pend[pstride() * i] == 0 {
+            found = i;
+        }
+        i = i + 1;
+    }
+    if found < 0 {
+        return 0 - 1;
+    }
+    let b = pstride() * found;
+    pend[b] = 2;
+    pend[b + 1] = kind;
+    pend[b + 2] = client;
+    pend[b + 3] = 0;
+    pend[b + 4] = 0;
+    pend[b + 5] = 0;
+    pend[b + 6] = 0 - 1;
+    pend[b + 7] = len(data);
+    pend[b + 8] = 0 - 1;
+    pend[b + 9] = 0;
+    pend[b + 10] = generation;
+    pend[b + 11] = 0 - 1;
+    var k = 0;
+    while k < len(data) {
+        qbuf[qmax() * found + k] = data[k];
+        k = k + 1;
+    }
+    meta[1] = meta[1] + 1;
+    meta[2] = meta[2] + 1;
+    return found;
 }
 
 // ---------------------------------------------------------------------
@@ -146,8 +272,15 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
         turns = turns + 1;
         match udp_recv_from(sock, dg, who) {
             Datagram::Got(n) => {
-                let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now);
-                if sent > 0 {
+                let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0);
+                if sent == 0 - 1 {
+                    if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0) < 0 {
+                        let failed = dns.encode_error(sc, dg[0..n], tb, 2, stub.udp_ceiling());
+                        if failed > 0 {
+                            udp_send_to(sock, sc[0..failed], who[0]);
+                        }
+                    }
+                } else if sent > 0 {
                     udp_send_to(sock, sc[0..sent], who[0]);
                 }
             }
@@ -203,6 +336,8 @@ fn shut[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [] int {
     let st = contents(core.state);
     conns.close(tab, k);
     st[stride() * k + 1] = 0;
+    st[stride() * k + 6] = 0;
+    st[stride() * k + 7] = st[stride() * k + 7] + 1;
     return 0;
 }
 
@@ -237,7 +372,7 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, now: int) -> [c
     var used = 0;
     var going = true;
     while going {
-        if st[p + 2] != 0 || st[p + 3] != 0 || st[p] - used < 2 {
+        if st[p + 2] != 0 || st[p + 3] != 0 || st[p + 6] != 0 || st[p] - used < 2 {
             going = false;
         } else {
             let size = int_of(bf[base + used]) * 256 + int_of(bf[base + used + 1]);
@@ -249,7 +384,18 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, now: int) -> [c
                 going = false;
             } else {
                 let view = bf[base + used + 2..base + used + 2 + size];
-                let n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now);
+                var n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now, upstreams.count() > 0);
+                if n == 0 - 1 {
+                    // It has to go upstream: this connection waits for the answer before its next message is read.
+                    let slot = begin(contents(core.pend), contents(core.qbuf), contents(core.meta), view, 1, k, st[p + 7]);
+                    if slot >= 0 {
+                        st[p + 6] = slot + 1;
+                        going = false;
+                        n = 0;
+                    } else {
+                        n = dns.encode_error(sc[2..len(sc)], view, tb, 2, stub.udp_ceiling());
+                    }
+                }
                 if n > 0 {
                     dns.put16(sc, 0, n);
                     st[p + 2] = emit(tab, k, sc[0..2 + n], pd[obase..obase + output_size()], st[p + 2]);
@@ -401,10 +547,328 @@ fn sweep[&t, &c](tab: &!t conns.Table, core: &!c Core, now: int, idle: int) -> [
 }
 
 // ---------------------------------------------------------------------
+// Forwarding
+// ---------------------------------------------------------------------
+
+// The upstream for the next attempt: a healthy one (not marked down), chosen at random from the table so that the load and the
+// first guess are not the same every time, and not `avoid` unless it is the only one. -1 if every upstream is down.
+fn pick[&r, &h](random: &!r rng.Rng, hl: &h [int], now: int, avoid: int) -> [] int {
+    let n = upstreams.count();
+    if n <= 0 {
+        return 0 - 1;
+    }
+    let first = rng.below(random, n);
+    var pass = 0;
+    var chosen = 0 - 1;
+    while pass < 2 && chosen < 0 {
+        var k = 0;
+        while k < n && chosen < 0 {
+            let u = (first + k) % n;
+            if hl[2 * u + 1] <= now && (pass == 1 || u != avoid) {
+                chosen = u;
+            }
+            k = k + 1;
+        }
+        pass = pass + 1;
+    }
+    return chosen;
+}
+
+// Free pending query `i`: close its socket if it has one and give the slot back.
+fn release_query[&s, &c](socks: &!s conns.Table, core: &!c Core, i: int) -> [] int {
+    let pend = contents(core.pend);
+    let meta = contents(core.meta);
+    let b = pstride() * i;
+    if pend[b] == 1 {
+        udps.close(socks, pend[b + 8]);
+    }
+    if pend[b] == 2 {
+        meta[1] = meta[1] - 1;
+    }
+    pend[b] = 0;
+    meta[2] = meta[2] - 1;
+    return 0;
+}
+
+// Send the answer in `scratch[2..2 + n]` to whoever asked pending query `i`. A datagram's client is answered through its ticket; a TCP
+// client only if its connection is still the one that asked. Answers the connection to carry on with, or -1.
+fn deliver[&t, &u, &c](tab: &!t conns.Table, sock: &!u Udp, core: &!c Core, i: int, n: int, now: int) -> [udp_send, conn_write] int {
+    let pend = contents(core.pend);
+    let sc = contents(core.scratch);
+    let b = pstride() * i;
+    if pend[b + 1] == 0 {
+        udp_send_to(sock, sc[2..2 + n], pend[b + 2]);
+        return 0 - 1;
+    }
+    let k = pend[b + 2];
+    let st = contents(core.state);
+    let p = stride() * k;
+    if st[p + 1] != 1 || st[p + 7] != pend[b + 10] || st[p + 6] != i + 1 {
+        return 0 - 1;
+    }
+    dns.put16(sc, 0, n);
+    st[p + 2] = emit(tab, k, sc[0..2 + n], contents(core.pends)[k * output_size()..(k + 1) * output_size()], st[p + 2]);
+    st[p + 6] = 0;
+    st[p + 5] = now;
+    if st[p + 2] < 0 {
+        shut(tab, core, k);
+        return 0 - 1;
+    }
+    return k;
+}
+
+// Answer pending query `i` SERVFAIL, keep that for a few seconds so that a dead upstream is not asked again for every query, and
+// deliver it. Answers the TCP connection to carry on with, or -1.
+fn fail_query[&t, &u, &c](tab: &!t conns.Table, sock: &!u Udp, core: &!c Core, i: int, now: int) -> [udp_send, conn_write] int {
+    let pend = contents(core.pend);
+    let qb = contents(core.qbuf);
+    let sc = contents(core.scratch);
+    let tb = contents(core.table);
+    let ut = contents(core.utable);
+    let b = pstride() * i;
+    let q = qb[qmax() * i..qmax() * i + pend[b + 7]];
+    if dns.parse(q, tb) < 0 {
+        return 0 - 1;
+    }
+    let n = dns.encode_error(sc[2..len(sc)], q, tb, 2, stub.udp_ceiling());
+    if n <= 0 {
+        return 0 - 1;
+    }
+    if dns.parse(sc[2..2 + n], ut) == n {
+        cache.insert(core.answers, now, q, tb, sc[2..2 + n], ut);
+    }
+    cache.note(core.answers, n_servfail());
+    return deliver(tab, sock, core, i, n, now);
+}
+
+// Send pending query `i` upstream: a new id, the name in a new random case, a new connected socket (so a new source port), and the
+// socket watched under `256 + i`. Answers the socket table and whether it went.
+fn start[&h, &n, &c](heap: &!h Heap, nn: &n Net(""), socks: conns.Table, core: &!c Core, i: int, now: int) -> [heap, net_out(""), udp_send, poll] (conns.Table, bool) {
+    let pend = contents(core.pend);
+    let qb = contents(core.qbuf);
+    let sb = contents(core.sbuf);
+    let nb = contents(core.nbuf);
+    let tb = contents(core.table);
+    let b = pstride() * i;
+    let q = qb[qmax() * i..qmax() * i + pend[b + 7]];
+    if dns.parse(q, tb) < 0 {
+        return (socks, false);
+    }
+    let u = pick(core.rnd, contents(core.health), now, pend[b + 11]);
+    if u < 0 {
+        return (socks, false);
+    }
+    let name = dns.name_expand(q, dns.header_size(), nb);
+    if name < 0 {
+        return (socks, false);
+    }
+    forward.randomize_case(core.rnd, nb[0..name]);
+    let id = rng.u16(core.rnd);
+    let sent = dns.encode_query(sb[smax() * i..smax() * (i + 1)], id, nb[0..name], tb[7], tb[8], 1232, true);
+    if sent < 0 {
+        return (socks, false);
+    }
+    match udp_connect(nn, upstreams.host(u), upstreams.port(u)) {
+        UdpOpened::Ok(s) => {
+            let (grown, slot) = udps.put(heap, socks, s);
+            var table = grown;
+            var ok = false;
+            if slot >= 0 {
+                borrow mut table as &!tt in {
+                    if udps.nonblocking(tt, slot) == 0 && udps.watch(tt, core.poller, slot, up_token() + i, 1) == 0 {
+                        match udps.send(tt, slot, sb[smax() * i..smax() * i + sent]) {
+                            Sent::Wrote(w) => {
+                                ok = true;
+                            }
+                            Sent::Again => {
+                            }
+                            Sent::Failed(e) => {
+                            }
+                        }
+                    }
+                    if !ok {
+                        udps.close(tt, slot);
+                    }
+                }
+            }
+            if ok {
+                pend[b] = 1;
+                pend[b + 3] = id;
+                pend[b + 4] = now + attempt_ms();
+                pend[b + 5] = pend[b + 5] + 1;
+                pend[b + 6] = u;
+                pend[b + 8] = slot;
+                pend[b + 9] = sent;
+                cache.note(core.answers, n_sent());
+            }
+            return (table, ok);
+        }
+        UdpOpened::Failed(e) => {
+            return (socks, false);
+        }
+    }
+}
+
+// Send every query that is waiting to be sent (new, or timed out once). One that cannot be sent is answered SERVFAIL.
+fn launch_pending[&h, &n, &t, &u, &c](heap: &!h Heap, nn: &n Net(""), socks: conns.Table, tab: &!t conns.Table, sock: &!u Udp, core: &!c Core, now: int) -> [heap, net_out(""), udp_send, poll, conn_write] conns.Table {
+    var table = socks;
+    var i = 0;
+    while contents(core.meta)[1] > 0 && i < max_pending() {
+        if contents(core.pend)[pstride() * i] == 2 {
+            let (grown, ok) = start(heap, nn, table, core, i, now);
+            table = grown;
+            if ok {
+                contents(core.meta)[1] = contents(core.meta)[1] - 1;
+            } else {
+                var more = 0 - 1;
+                borrow mut table as &!tt in {
+                    more = fail_query(tab, sock, core, i, now);
+                    release_query(tt, core, i);
+                }
+                if more >= 0 {
+                    process(tab, core, more, now);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return table;
+}
+
+// The reply in `rbuf[0..n]` came on the socket of pending query `i`. Answers whether it was the answer: if so the query is finished
+// (cached, delivered, freed); if not it is counted and dropped, and the query goes on waiting for the real one.
+fn take_reply[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, i: int, n: int, now: int) -> [udp_send, conn_write, poll] bool {
+    let pend = contents(core.pend);
+    let qb = contents(core.qbuf);
+    let sb = contents(core.sbuf);
+    let rb = contents(core.rbuf);
+    let sc = contents(core.scratch);
+    let tb = contents(core.table);
+    let ut = contents(core.utable);
+    let hl = contents(core.health);
+    let b = pstride() * i;
+    let reply = rb[0..n];
+    let verdict = forward.judge(reply, sb[smax() * i..smax() * i + pend[b + 9]], pend[b + 3]);
+    if verdict != forward.accepted() {
+        cache.note(core.answers, verdict + 2);
+        return false;
+    }
+    let q = qb[qmax() * i..qmax() * i + pend[b + 7]];
+    let udp_client = pend[b + 1] == 0;
+    var more = 0 - 1;
+    if dns.parse(q, tb) < 0 {
+        release_query(socks, core, i);
+        return true;
+    }
+    hl[2 * pend[b + 6]] = 0;
+    var len_out = 0;
+    if dns.parse(reply, ut) < 0 {
+        cache.note(core.answers, n_drop_parse());
+    } else {
+        var limit = 0;
+        if udp_client {
+            limit = stub.udp_limit(tb);
+        }
+        cache.insert(core.answers, now, q, tb, reply, ut);
+        len_out = cache.reread(core.answers, now, q, tb, sc[2..len(sc)], limit);
+        if len_out <= 0 && udp_client && ut[1] / 512 % 2 == 1 {
+            // The upstream's answer was cut: pass that on, so the client asks again over TCP.
+            len_out = dns.encode_error(sc[2..len(sc)], q, tb, 0, stub.udp_ceiling());
+            if len_out > 0 {
+                sc[4] = byte_of(int_of(sc[4]) + 2);
+            }
+        }
+    }
+    if len_out > 0 {
+        more = deliver(tab, sock, core, i, len_out, now);
+        release_query(socks, core, i);
+    } else {
+        more = fail_query(tab, sock, core, i, now);
+        release_query(socks, core, i);
+    }
+    if more >= 0 {
+        process(tab, core, more, now);
+    }
+    return true;
+}
+
+// The poller said the socket of pending query `i` is readable: read what is there (a few datagrams at most), keeping the first that
+// is the answer.
+fn on_upstream[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, i: int, now: int) -> [udp_recv, udp_send, conn_write, poll] int {
+    var turns = 0;
+    var more = true;
+    while more && turns < 8 {
+        turns = turns + 1;
+        let b = pstride() * i;
+        if contents(core.pend)[b] != 1 {
+            return 0;
+        }
+        match udps.recv(socks, contents(core.pend)[b + 8], contents(core.rbuf)) {
+            Datagram::Got(n) => {
+                if take_reply(tab, socks, sock, core, i, n, now) {
+                    more = false;
+                }
+            }
+            Datagram::Truncated(n) => {
+                cache.note(core.answers, n_drop_parse());
+            }
+            Datagram::Again => {
+                more = false;
+            }
+            Datagram::Failed(e) => {
+                more = false;
+            }
+        }
+    }
+    return 0;
+}
+
+// Look at the attempts that have run out of time, at most every 100 milliseconds. An upstream that fails three times in a row is
+// left alone for a while. A query gets two attempts, the second to another upstream if there is one; after that it is SERVFAIL.
+fn expire[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, now: int) -> [udp_send, conn_write, poll] int {
+    let meta = contents(core.meta);
+    if now - meta[0] < 100 || meta[2] == 0 {
+        return 0;
+    }
+    meta[0] = now;
+    let pend = contents(core.pend);
+    let hl = contents(core.health);
+    var i = 0;
+    while i < max_pending() {
+        let b = pstride() * i;
+        if pend[b] == 1 && pend[b + 4] <= now {
+            cache.note(core.answers, n_timeout());
+            let u = pend[b + 6];
+            hl[2 * u] = hl[2 * u] + 1;
+            if hl[2 * u] >= 3 {
+                hl[2 * u + 1] = now + down_ms();
+                hl[2 * u] = 0;
+            }
+            udps.close(socks, pend[b + 8]);
+            pend[b + 8] = 0 - 1;
+            if pend[b + 5] < 2 {
+                pend[b] = 2;
+                pend[b + 11] = u;
+                meta[1] = meta[1] + 1;
+            } else {
+                pend[b] = 3;
+                let more = fail_query(tab, sock, core, i, now);
+                release_query(socks, core, i);
+                if more >= 0 {
+                    process(tab, core, more, now);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------
 
-fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, clock: &k Clock, idle: int, memory: int, keys: int, min_ttl: int) -> [heap, conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
+fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Listener, sock: &!u Udp, clock: &k Clock, seed: &s [byte], idle: int, memory: int, keys: int, min_ttl: int) -> [heap, net_out(""), conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
     match poller_new() {
         Polling::Ok(p) => {
             var poller = p;
@@ -413,12 +877,25 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                 poller_add_udp(pw, sock, 1, 1);
             }
             let limit = max_connections();
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, 0, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0) };
+            // The cache's hash seed is drawn at start, so a client that picks names cannot aim collisions at the index.
+            var rnd0 = rng.open(heap, seed);
+            var hash_seed = 0;
+            borrow mut rnd0 as &!rw in {
+                hash_seed = rng.u32(rw);
+            }
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0) };
             var tab = conns.empty(heap, 64);
+            var socks = conns.empty(heap, 64);
             while true {
                 var ready = 0 - 1;
+                var wait = 1000;
+                borrow core as &cr in {
+                    if contents(cr.meta)[2] > 0 {
+                        wait = 100;
+                    }
+                }
                 borrow mut core as &!cw in {
-                    ready = poller_wait(cw.poller, contents(cw.events), 1000);
+                    ready = poller_wait(cw.poller, contents(cw.events), wait);
                 }
                 let now = clock_ms(clock);
                 var j = 0;
@@ -437,6 +914,14 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                         borrow mut core as &!cw in {
                             serve_udp(sock, cw, now);
                         }
+                    } else if token >= up_token() {
+                        borrow mut tab as &!tw in {
+                            borrow mut socks as &!sw in {
+                                borrow mut core as &!cw in {
+                                    on_upstream(tw, sw, sock, cw, token - up_token(), now);
+                                }
+                            }
+                        }
                     } else {
                         borrow mut tab as &!tw in {
                             borrow mut core as &!cw in {
@@ -449,14 +934,23 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
                     j = j + 1;
                 }
                 borrow mut tab as &!tw in {
+                    borrow mut socks as &!sw in {
+                        borrow mut core as &!cw in {
+                            cache.tick(cw.answers, now);
+                            sweep(tw, cw, now, idle);
+                            expire(tw, sw, sock, cw, now);
+                        }
+                    }
+                }
+                borrow mut tab as &!tw in {
                     borrow mut core as &!cw in {
-                        cache.tick(cw.answers, now);
-                        sweep(tw, cw, now, idle);
+                        socks = launch_pending(heap, nn, socks, tw, sock, cw, now);
                     }
                 }
             }
             conns.drop(heap, tab);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable } = core;
+            udps.drop(heap, socks);
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -468,6 +962,14 @@ fn run[&h, &l, &u, &k](heap: &!h Heap, listener: &!l Listener, sock: &!u Udp, cl
             unbox_slice(heap, who);
             cache.close(heap, answers);
             unbox_slice(heap, upstream);
+            rng.close(heap, rnd);
+            unbox_slice(heap, pend);
+            unbox_slice(heap, qbuf);
+            unbox_slice(heap, sbuf);
+            unbox_slice(heap, nbuf);
+            unbox_slice(heap, rbuf);
+            unbox_slice(heap, health);
+            unbox_slice(heap, meta);
             unbox_slice(heap, utable);
             return 0;
         }
@@ -496,8 +998,8 @@ fn number_of[&t](text: &t [byte]) -> [] int {
 
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock } = split(world);
-    release(fs);
     release(ffi);
+    let urandom = narrow(fs, "/dev/urandom");
     var port = 0 - 1;
     var idle = 10;
     var min_ttl = 10;
@@ -545,7 +1047,18 @@ fn main(world: World) -> [] int {
                                             buffer.drop(h, line);
                                         }
                                         borrow clock as &c in {
-                                            status = run(h, lh, uh, c, idle * 1000, memory, keys, min_ttl);
+                                            region r {
+                                                let entropy = alloc_slice[r](32, byte_of(0));
+                                                var got = 0;
+                                                borrow urandom as &ur in {
+                                                    got = fs_read(ur, "/dev/urandom", entropy);
+                                                }
+                                                if got == 32 {
+                                                    status = run(h, nn, lh, uh, c, entropy, idle * 1000, memory, keys, min_ttl);
+                                                } else {
+                                                    status = 5;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -562,6 +1075,7 @@ fn main(world: World) -> [] int {
             }
         }
     }
+    release(urandom);
     release(net);
     release(clock);
     release(args);

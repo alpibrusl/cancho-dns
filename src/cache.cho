@@ -41,7 +41,8 @@ pub res struct Cache {
     tmp: Box[[byte]],
     // 0 smallest positive TTL, 1 largest, 2 smallest negative, 3 largest negative, 4 the SERVFAIL TTL (seconds).
     limits: Box[[int]],
-    // 0 hits, 1 misses, 2 stored, 3 not cacheable, 4 refused for lack of room.
+    // 0 hits, 1 misses, 2 stored, 3 not cacheable, 4 refused for lack of room; 5 and up are the forwarder's, counted here so that
+    // `stats.bind.` shows everything in one place (see `note` and `stats_reply`).
     counts: Box[[int]],
 }
 
@@ -57,7 +58,7 @@ pub fn open[&h](heap: &!h Heap, memory: int, max_keys: int, seed: int, min_ttl: 
         l[3] = 3600;
         l[4] = 5;
     }
-    return Cache { store: store.open(heap, memory, max_keys, seed, store.evict_lru()), key: box_slice(heap, key_max(), byte_of(0)), value: box_slice(heap, prefix() + entry_max(), byte_of(0)), cur: box_slice(heap, 256, byte_of(0)), tmp: box_slice(heap, 256, byte_of(0)), limits: limits, counts: box_slice(heap, 5, 0) };
+    return Cache { store: store.open(heap, memory, max_keys, seed, store.evict_lru()), key: box_slice(heap, key_max(), byte_of(0)), value: box_slice(heap, prefix() + entry_max(), byte_of(0)), cur: box_slice(heap, 256, byte_of(0)), tmp: box_slice(heap, 256, byte_of(0)), limits: limits, counts: box_slice(heap, 16, 0) };
 }
 
 pub fn close[&h](heap: &!h Heap, c: Cache) -> [heap] int {
@@ -115,6 +116,10 @@ pub fn expired[&c](cache: &c Cache) -> [] int {
 pub fn tick[&c](cache: &!c Cache, now: int) -> [] int {
     store.tick(cache.store, now);
     return store.sweep(cache.store, 16);
+}
+
+pub fn note[&c](cache: &!c Cache, which: int) -> [] int {
+    return bump(cache, 5 + which);
 }
 
 fn bump[&c](cache: &!c Cache, which: int) -> [] int {
@@ -542,6 +547,15 @@ pub fn stats_reply[&c, &q, &t, &o](cache: &c Cache, query: &q [byte], table: &t 
     p = dns.put32(out, p, 0);
     let rdlen = p;
     p = p + 2;
+    p = put_stat(out, p, "fwd_sent", contents(cache.counts)[5]);
+    p = put_stat(out, p, "fwd_timeout", contents(cache.counts)[6]);
+    p = put_stat(out, p, "fwd_servfail", contents(cache.counts)[7]);
+    p = put_stat(out, p, "drop_id", contents(cache.counts)[8]);
+    p = put_stat(out, p, "drop_question", contents(cache.counts)[9]);
+    p = put_stat(out, p, "drop_not_response", contents(cache.counts)[10]);
+    p = put_stat(out, p, "drop_case", contents(cache.counts)[11]);
+    p = put_stat(out, p, "drop_short", contents(cache.counts)[12]);
+    p = put_stat(out, p, "drop_parse", contents(cache.counts)[13]);
     p = put_stat(out, p, "hits", hits(cache));
     p = put_stat(out, p, "misses", misses(cache));
     p = put_stat(out, p, "stored", stored(cache));
