@@ -10,6 +10,7 @@ import rng;
 import forward;
 import upstreams;
 import limit;
+import local;
 import access;
 import std.udps;
 import std.addr;
@@ -143,6 +144,10 @@ fn n_rate_dropped() -> [] int {
     return 10;
 }
 
+fn n_local_answered() -> [] int {
+    return 11;
+}
+
 res struct Core {
     poller: Poller,
     // `poller_wait` fills these with (token, readiness) pairs.
@@ -173,6 +178,10 @@ res struct Core {
     rbuf: Box[[byte]],
     health: Box[[int]],
     meta: Box[[int]],
+    // The compiled-in local records, overrides and blocklists (`docs/design.md` section 17).
+    locals: local.Local,
+    // The expanded question name, for matching against the local table.
+    lname: Box[[byte]],
     // Who may ask, and how fast (`docs/design.md` section 16).
     limiter: limit.Limiter,
     // The 19 bytes `udp_peer` writes a sender into.
@@ -187,7 +196,7 @@ res struct Core {
 // the client can take; TCP does not. A question the resolver can answer is looked up in the cache first; on a miss the stub (the
 // upstream, until there is a forwarder) answers into `up`, the reply goes through `cache.insert` exactly as a forwarded one will, and
 // the client is served from the entry; a reply that is not cacheable (a refusal, no SOA) is sent as it is.
-fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int, forwarding: bool) -> [] int {
+fn handle[&d, &t, &o, &k, &u, &v, &l, &s](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int, forwarding: bool, locals: &l local.Local, scratch: &!s [byte]) -> [] int {
     if dns.is_response(data) {
         return 0;
     }
@@ -200,6 +209,21 @@ fn handle[&d, &t, &o, &k, &u, &v](data: &d [byte], table: &!t [int], out: &!o [b
     }
     if cache.is_stats(data, table) {
         return cache.stats_reply(answers, data, table, out);
+    }
+    // The compiled-in local table is asked first (`docs/design.md` section 17): a match answers here and is never
+    // cached and never forwarded, so an `override` beats a cached answer and a `block` never reaches an upstream.
+    if table[1] / 2048 % 16 == 0 && table[8] == 1 {
+        let found = local.find_query(locals, data, table, scratch);
+        if found >= 0 {
+            cache.note(answers, n_local_answered());
+            let question_end = dns.name_end(data, dns.header_size()) + 4;
+            let n = local.respond(out, data, table, locals, found, question_end, limit);
+            if n > 0 {
+                return n;
+            }
+            // The reply did not fit the buffer: SERVFAIL is small.
+            return dns.encode_error(out, data, table, 2, stub.udp_ceiling());
+        }
     }
     let asks_cache = table[1] / 2048 % 16 == 0 && table[8] == 1 && table[7] != 251 && table[7] != 252 && (table[9] < 0 || table[12] == 0);
     if asks_cache {
@@ -331,7 +355,7 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
                         }
                     }
                 } else {
-                    let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0);
+                    let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname));
                     if sent == 0 - 1 {
                         if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0) < 0 {
                             let failed = dns.encode_error(sc, dg[0..n], tb, 2, stub.udp_ceiling());
@@ -444,7 +468,7 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, now: int) -> [c
                 going = false;
             } else {
                 let view = bf[base + used + 2..base + used + 2 + size];
-                var n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now, upstreams.count() > 0);
+                var n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname));
                 if n == 0 - 1 {
                     // It has to go upstream: this connection waits for the answer before its next message is read.
                     let slot = begin(contents(core.pend), contents(core.qbuf), contents(core.meta), view, 1, k, st[p + 7]);
@@ -957,7 +981,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
                 hash_seed = rng.u32(rw);
                 limit_key = rng.u32(rw);
             }
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), limiter: limit.open(heap, rate, burst, limit_key), peerbuf: box_slice(heap, 19, byte_of(0)) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), locals: local.open(heap), lname: box_slice(heap, 256, byte_of(0)), limiter: limit.open(heap, rate, burst, limit_key), peerbuf: box_slice(heap, 19, byte_of(0)) };
             var tab = conns.empty(heap, 64);
             var socks = conns.empty(heap, 64);
             while true {
@@ -1024,7 +1048,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             }
             conns.drop(heap, tab);
             udps.drop(heap, socks);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, limiter, peerbuf } = core;
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, locals, lname, limiter, peerbuf } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -1045,6 +1069,8 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             unbox_slice(heap, health);
             unbox_slice(heap, meta);
             limit.close(heap, limiter);
+            local.close(heap, locals);
+            unbox_slice(heap, lname);
             unbox_slice(heap, peerbuf);
             unbox_slice(heap, utable);
             return 0;

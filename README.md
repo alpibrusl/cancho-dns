@@ -19,7 +19,7 @@ A forwarding cache:
 - DNS over UDP and TCP, with EDNS0 and truncation;
 - a cache with TTLs, negative caching and LRU eviction, in a fixed arena;
 - forwarding to a fixed set of upstream resolvers (a compiled-in table in v1), with timeouts and health;
-- local records from a small bounded file, and overrides;
+- local records, overrides and blocklists from a small bounded file (a compiled-in table in v1: `local.conf`, at most 512 directives, every bound a generation-time refusal naming file and line; a match answers with TTL 30, is never cached and never forwarded);
 - the defences that matter: random transaction IDs and source ports, 0x20 case randomisation, bailiwick checks, response rate limiting;
 - bounded JSON logs and metrics, with no files written;
 - operable by an agent: `introspect` and `skill`, errors as data with rule tags and repairs, and `check` and `explain` commands that say what a configuration or a query would do without sending anything.

@@ -35,7 +35,7 @@ for old, new, why in MUTANTS:
             print("MUTANT DOES NOT APPLY:", why); sys.exit(2)
         open(f, "w").write(text.replace(old, new, 1))
         try:
-            t = subprocess.run([cancho, "test", "tests/cache_test.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "--std"],
+            t = subprocess.run([cancho, "test"] + (["--backend", os.environ["CANCHO_BACKEND"]] if os.environ.get("CANCHO_BACKEND") else []) + ["tests/cache_test.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "--std"],
                                cwd=d, capture_output=True, text=True, timeout=300)
             dead = t.returncode != 0
             if dead and "error" in t.stderr + t.stdout and "FAILED" not in t.stdout:
