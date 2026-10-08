@@ -40,7 +40,7 @@ record 1.0.2.192.in-addr.arpa PTR www.example
 
 
 def main():
-    cancho, runner = sys.argv[1], sys.argv[2]
+    cancho, runner = os.path.abspath(sys.argv[1]), sys.argv[2]
     backend = os.environ.get("CANCHO_BACKEND")
     killed = 0
     for path, old, new, why in MUTANTS:
