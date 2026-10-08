@@ -9,6 +9,8 @@ import cache;
 import rng;
 import forward;
 import upstreams;
+import limit;
+import access;
 import std.udps;
 
 // `server` -- `docs/design.md` sections 13 to 15: UDP and TCP on one poller; an answer cache (`src/cache.cho`); and, when the compiled-in
@@ -16,7 +18,8 @@ import std.udps;
 // random id and a random case (`src/forward.cho`), and answers the client when the upstream does. With no upstream it answers from the
 // test stub (`src/stub.cho`) instead.
 //
-//     server <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys>]]]]     (10 seconds, 10 seconds, 16 MiB, 65,536 keys)
+//     server <port> [<idle seconds> [<min ttl> [<cache bytes> [<cache keys> [<responses a second> [<burst>]]]]]]
+//                   (10 s, 10 s, 16 MiB, 65,536 keys, 1,000 a second per /24 -- 0 for no limit -- and a burst of 2,000)
 //
 // One thread, one `Poller`. Token 0 is the TCP listener, token 1 the UDP socket, token `2 + slot` a TCP connection, token `256 + i` the
 // socket of pending query `i`.
@@ -131,6 +134,14 @@ fn n_drop_parse() -> [] int {
     return 8;
 }
 
+fn n_acl_refused() -> [] int {
+    return 9;
+}
+
+fn n_rate_dropped() -> [] int {
+    return 10;
+}
+
 res struct Core {
     poller: Poller,
     // `poller_wait` fills these with (token, readiness) pairs.
@@ -161,6 +172,8 @@ res struct Core {
     rbuf: Box[[byte]],
     health: Box[[int]],
     meta: Box[[int]],
+    // Who may ask, and how fast (`docs/design.md` section 16).
+    limiter: limit.Limiter,
 }
 
 // ---------------------------------------------------------------------
@@ -272,16 +285,35 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
         turns = turns + 1;
         match udp_recv_from(sock, dg, who) {
             Datagram::Got(n) => {
-                let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0);
-                if sent == 0 - 1 {
-                    if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0) < 0 {
-                        let failed = dns.encode_error(sc, dg[0..n], tb, 2, stub.udp_ceiling());
-                        if failed > 0 {
-                            udp_send_to(sock, sc[0..failed], who[0]);
+                // Who is it? A ticket that does not name a sender is -1, which falls below every prefix.
+                let peer = udp_peer(sock, who[0]);
+                var address = 0;
+                if peer >= 0 {
+                    address = peer / 65536;
+                }
+                if !limit.allow(core.limiter, address, now) {
+                    // Over its bucket: no answer at all, not even a refusal.
+                    cache.note(core.answers, n_rate_dropped());
+                } else if peer < 0 || !access.allowed(address) {
+                    cache.note(core.answers, n_acl_refused());
+                    if !dns.is_response(dg[0..n]) && dns.parse(dg[0..n], tb) >= 0 {
+                        let refusal = dns.encode_error(sc, dg[0..n], tb, 5, stub.udp_ceiling());
+                        if refusal > 0 {
+                            udp_send_to(sock, sc[0..refusal], who[0]);
                         }
                     }
-                } else if sent > 0 {
-                    udp_send_to(sock, sc[0..sent], who[0]);
+                } else {
+                    let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0);
+                    if sent == 0 - 1 {
+                        if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0) < 0 {
+                            let failed = dns.encode_error(sc, dg[0..n], tb, 2, stub.udp_ceiling());
+                            if failed > 0 {
+                                udp_send_to(sock, sc[0..failed], who[0]);
+                            }
+                        }
+                    } else if sent > 0 {
+                        udp_send_to(sock, sc[0..sent], who[0]);
+                    }
                 }
             }
             Datagram::Truncated(n) => {
@@ -514,7 +546,12 @@ fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Liste
                         st[p + 4] = 1;
                         st[p + 5] = now;
                         borrow mut table as &!ct in {
-                            if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 2, 1) != 0 {
+                            let peer = conns.peer(ct, slot);
+                            if peer < 0 || !access.allowed(peer / 65536) {
+                                // Not a network this serves: closed without a byte read.
+                                cache.note(core.answers, n_acl_refused());
+                                shut(ct, core, slot);
+                            } else if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 2, 1) != 0 {
                                 shut(ct, core, slot);
                             }
                         }
@@ -868,7 +905,7 @@ fn expire[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!
 // The loop
 // ---------------------------------------------------------------------
 
-fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Listener, sock: &!u Udp, clock: &k Clock, seed: &s [byte], idle: int, memory: int, keys: int, min_ttl: int) -> [heap, net_out(""), conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
+fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Listener, sock: &!u Udp, clock: &k Clock, seed: &s [byte], idle: int, memory: int, keys: int, min_ttl: int, rate: int, burst: int) -> [heap, net_out(""), conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
     match poller_new() {
         Polling::Ok(p) => {
             var poller = p;
@@ -880,10 +917,12 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             // The cache's hash seed is drawn at start, so a client that picks names cannot aim collisions at the index.
             var rnd0 = rng.open(heap, seed);
             var hash_seed = 0;
+            var limit_key = 0;
             borrow mut rnd0 as &!rw in {
                 hash_seed = rng.u32(rw);
+                limit_key = rng.u32(rw);
             }
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), limiter: limit.open(heap, rate, burst, limit_key) };
             var tab = conns.empty(heap, 64);
             var socks = conns.empty(heap, 64);
             while true {
@@ -950,7 +989,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             }
             conns.drop(heap, tab);
             udps.drop(heap, socks);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta } = core;
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, limiter } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -970,6 +1009,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             unbox_slice(heap, rbuf);
             unbox_slice(heap, health);
             unbox_slice(heap, meta);
+            limit.close(heap, limiter);
             unbox_slice(heap, utable);
             return 0;
         }
@@ -1005,6 +1045,8 @@ fn main(world: World) -> [] int {
     var min_ttl = 10;
     var memory = 16777216;
     var keys = 65536;
+    var rate = 1000;
+    var burst = 2000;
     borrow args as &g in {
         if arg_count(g) > 1 {
             port = number_of(arg(g, 1));
@@ -1021,9 +1063,15 @@ fn main(world: World) -> [] int {
         if arg_count(g) > 5 {
             keys = number_of(arg(g, 5));
         }
+        if arg_count(g) > 6 {
+            rate = number_of(arg(g, 6));
+        }
+        if arg_count(g) > 7 {
+            burst = number_of(arg(g, 7));
+        }
     }
     var status = 2;
-    if port > 0 && port < 65536 && idle > 0 && idle < 86400 && min_ttl > 0 && min_ttl <= 3600 && memory >= 65536 && keys >= 16 {
+    if port > 0 && port < 65536 && idle > 0 && idle < 86400 && min_ttl > 0 && min_ttl <= 3600 && memory >= 65536 && keys >= 16 && rate >= 0 && burst >= 1 && burst < 1000000 {
         status = 3;
         borrow net as &nn in {
             match tcp_listen(nn, port, 128, 0) {
@@ -1054,7 +1102,7 @@ fn main(world: World) -> [] int {
                                                     got = fs_read(ur, "/dev/urandom", entropy);
                                                 }
                                                 if got == 32 {
-                                                    status = run(h, nn, lh, uh, c, entropy, idle * 1000, memory, keys, min_ttl);
+                                                    status = run(h, nn, lh, uh, c, entropy, idle * 1000, memory, keys, min_ttl, rate, burst);
                                                 } else {
                                                     status = 5;
                                                 }
