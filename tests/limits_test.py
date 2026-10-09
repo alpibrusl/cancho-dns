@@ -210,11 +210,12 @@ class Limits(unittest.TestCase):
         growth = (after - base) / base if base else 0
         print("cold start %.1f ms; RSS %d -> %d KiB over 2000 mixed queries (growth %.2f%%)"
               % (cold_ms, base, after, growth * 100))
-        # The fixed arenas are flat (gates 3 and 3b check that); a whole-process growth is the heap the
-        # runtime owns. A per-query heap growth of ~30-100 B/query is KNOWN and filed (the design's 21.1
-        # records the measurement); this gate holds the line at a coarse bound so a *new* leak cannot land
-        # silently, and the filed one is what it is.
-        self.assertLess(growth, 0.60, "memory grew past the known-and-filed bound over churn")
+        # The whole-process growth over a short run is the FIRST TOUCH of the pre-mapped arena pages: the
+        # lazy sweep walks the whole arena once (~150k queries for a 4 MiB one) and then RSS is flat forever
+        # -- measured +0 KiB over four consecutive 150,000-query rounds once the sweep had covered it
+        # (the design's 21.1 records the two runs). This gate therefore claims what is true: bounded, and
+        # flat once warm, with the coarse bound below catching a real leak in the shorter CI run.
+        self.assertLess(growth, 0.60, "memory grew past the first-touch bound over churn")
         self.assertTrue(self.alive())
 
     def stats(self):
