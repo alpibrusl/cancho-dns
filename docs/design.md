@@ -697,6 +697,22 @@ What this does not do: a coverage-guided fuzzer (the corpus is random and constr
 * **A finding, filed not hidden**: whole-process RSS grows **~32-128 B per query** indefinitely -- measured flat at 32 KiB per 1,000 pure cache-hit queries over 4,000 warmed queries, and ~128 KiB per 1,000 mixed ones. The fixed arenas are flat (gates 3 and 3b); the growth is heap the runtime owns, per query, and it does not stop at a cap in the runs taken (8 consecutive 1,000-query rounds grew each time). The cause is not identified here; it is filed as an issue with the measurements, the churn gate holds a coarse bound (60% over 2,000 queries) so a *new* leak cannot land silently, and the design claims only what the arena gates prove.
 * Test-side findings, recorded: the kernel counts a page only once touched, so a cold arena measures as growing until warmed (the churn baseline is warmed-to-warmed, gate 3b's own comparison); a client that reads between sends paces a flood at its own timeout and the bucket refills under it (the flood must be sent as fast as the socket allows); ANY is served (a bounded stub answer), not refused -- the design's refusal table said QUERY/IN, and type 255 is inside that.
 
+## 22. D10, the benchmark: the pre-registered cells, ours measured, the incumbents where the tools exist
+
+*Status: built (section 22.1 and `docs/numbers-d10.md`).* Task [#14](https://github.com/alpibrusl/cancho-dns/issues/14): the cells pre-registered in section 8.1, run against this resolver, the incumbents compared where they are installed.
+
+**The honest split, one more time.** The gated comparison (ours against Unbound on the same core, section 8.1) needs Unbound, dnsperf and a pinned runner. This slice builds and runs the harness: ours' cells are measured here (a rate-limited loopback client, which measures the resolver's own work per query), the numbers are recorded in `docs/numbers-d10.md` (the cancho-table pattern), and the incumbents' comparison runs where the tools are installed -- CI apt-installs them, and the harness prints a clear `SKIP` where they are absent rather than a number invented. **No ratio against Unbound is claimed anywhere in this slice**, because none was measured.
+
+### 22.1 Measured (ours, cranelift build, loopback, this host)
+
+* *Cell A* (UDP cache hit, 500-name Zipfian pool): **~146,000 q/s** answered, 64-deep pipeline, loopback. The client is the harness's own; `dnsperf` is the CI comparison.
+* *Cell B* (UDP miss, forwarded to the instant local stub): **~5,500 q/s** -- the forward path's fresh-socket-per-query cost (D3's design) is the visible number.
+* *Cell C* (TCP hit, one persistent connection): **~24,000 q/s**.
+* *Cell E* (latency at half of A): p50 **0.06 ms**, p99 **0.10 ms** on loopback.
+* *Cell D* (memory at 20,000 distinct names, 8 MiB arena, 65,536 keys): RSS **7.6 MiB** -- the arena's footprint, not a per-record growth (and the per-query heap growth of issue #31 is visible in the start-to-end spread and filed there).
+* *Footprint*: the binary is **228 KB**; listening in **8 ms** from `exec`.
+* What these cannot say: they are one loopback host, a cranelift (not release/LLVM) build, and a client the harness owns. The 0.9x-Unbound and 0.5x-memory criteria of section 8 are **not claimed and not tested** here; they are CI's once the incumbents are installed on a pinned runner, and a miss will be written in this section with the number.
+
 ## Reproduce (section 2)
 
 ```

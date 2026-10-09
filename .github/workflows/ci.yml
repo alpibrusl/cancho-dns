@@ -205,3 +205,9 @@ jobs:
       - name: "Amplification (gate 33)"
         working-directory: dns
         run: python3 tests/amplification_test.py build/server
+
+      - name: "The benchmark cells (task 14; the incumbents where apt can reach them)"
+        working-directory: dns
+        run: |
+          (sudo apt-get install -y dnsperf unbound dnsmasq >/dev/null 2>&1 || true)
+          python3 tests/benchmark_resolver.py ../cancho/target/release/cancho --quick
