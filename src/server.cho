@@ -1369,7 +1369,53 @@ fn main(world: World) -> [] int {
             }
         }
     }
+    // Startup validation collects every error as the toolbox's data and exits with the first error's
+    // code (`docs/design.md` section 18: every refusal at startup is {code, rule, message, hint, repair,
+    // detail} with a stable rule tag; the catalogue's exit code is what the process answers).
     var status = 2;
+    var bad_args = port <= 0 || port >= 65536 || (idle <= 0 || idle >= 86400) || (min_ttl <= 0 || min_ttl > 3600) || memory < 65536 || keys < 16 || rate < 0 || (burst < 1 || burst >= 1000000);
+    var error_code = 0;
+    borrow mut heap as &!eh in {
+        var errs = cli.errors_open(eh);
+        if port <= 0 || port >= 65536 {
+            errs = cli.add(eh, errs, "args.bad-port", "the port must be 1 to 65535", "pass the port to listen on, first", "choose a port between 1 and 65535; 53 is the resolver's");
+        }
+        if idle <= 0 || idle >= 86400 {
+            errs = cli.add(eh, errs, "args.bad-idle", "the idle timeout must be 1 to 86399 seconds", "the second argument", "a shorter idle closes silent clients sooner; 10 seconds is the default");
+        }
+        if min_ttl <= 0 || min_ttl > 3600 {
+            errs = cli.add(eh, errs, "args.bad-min-ttl", "the minimum TTL must be 1 to 3600 seconds", "the third argument", "the clamp the cache applies; 10 seconds is the default");
+        }
+        if memory < 65536 {
+            errs = cli.add(eh, errs, "args.bad-memory", "the cache arena must be at least 65536 bytes", "the fourth argument", "the arena is allocated once at start; 16 MiB is the default");
+        }
+        if keys < 16 {
+            errs = cli.add(eh, errs, "args.bad-keys", "the cache key cap must be at least 16", "the fifth argument", "the keys cap bounds the open-addressing index; 65536 is the default");
+        }
+        if rate < 0 {
+            errs = cli.add(eh, errs, "args.bad-rate", "the response rate cannot be negative", "the sixth argument", "0 turns the limiter off");
+        }
+        if burst < 1 || burst >= 1000000 {
+            errs = cli.add(eh, errs, "args.bad-burst", "the burst must be 1 to 999999", "the seventh argument", "the bucket's size in responses; 2000 is the default");
+        }
+        if bad_args {
+            borrow mut io as &!eio in {
+                error_code = cli.errors_print(eh, eio, errs);
+            }
+        } else {
+            let n = cli.errors_drop(eh, errs);
+        }
+    }
+    if bad_args {
+        release(net);
+        release(clock);
+        release(conf);
+        release(urandom);
+        release(args);
+        release(io);
+        release(heap);
+        return error_code;
+    }
     if port > 0 && port < 65536 && idle > 0 && idle < 86400 && min_ttl > 0 && min_ttl <= 3600 && memory >= 65536 && keys >= 16 && rate >= 0 && burst >= 1 && burst < 1000000 {
         status = 3;
         borrow net as &nn in {

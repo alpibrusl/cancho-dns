@@ -53,6 +53,38 @@ class Schema(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.validate(json.loads(r.stdout), "diff")
 
+    def test_startup_refusals_validate_over_a_corpus(self):
+        """Every startup error is the toolbox document: {code, rule, message, hint, repair, detail}, all
+        errors kept in input order, and the process exits with the first error's code (the catalogue's)."""
+        corpus = [
+            (["0"], 2),                                # a bad port alone
+            (["70000"], 2),                            # the other edge of the port
+            (["5300", "0"], 2),                          # a bad idle
+            (["5300", "10", "0"], 2),                    # a bad min-ttl
+            (["5300", "10", "10", "1024"], 2),            # a too-small arena
+            (["5300", "10", "10", "4194304", "4"], 2),   # a too-small key cap
+            (["5300", "10", "10", "4194304", "4096", "-1"], 2),   # a negative rate
+            (["5300", "10", "10", "4194304", "4096", "0", "0"], 2),  # a zero burst
+            (["70000", "-5", "0", "10", "2", "-1", "0"], 2),      # every argument wrong at once: all seven errors
+        ]
+        for args, want_exit in corpus:
+            r = run(*args)
+            self.assertEqual(r.returncode, want_exit, (args, r.stdout, r.stderr))
+            doc = json.loads(r.stdout)
+            self.validate(doc, "startup %s" % args)
+            self.assertFalse(doc["ok"])
+            for error in doc["errors"]:
+                self.assertIn("detail", error)
+                self.assertIn("hint", error)
+                self.assertEqual(error["repair"]["kind"], "none")
+        # And the all-wrong case keeps all seven, in input order.
+        r = run("70000", "-5", "0", "10", "2", "-1", "0")
+        doc = json.loads(r.stdout)
+        self.assertEqual(len(doc["errors"]), 7)
+        self.assertEqual([e["rule"] for e in doc["errors"]],
+                         ["args.bad-port", "args.bad-idle", "args.bad-min-ttl", "args.bad-memory",
+                          "args.bad-keys", "args.bad-rate", "args.bad-burst"])
+
     def test_the_schema_is_not_vacuous(self):
         # A document with a wrong shape is refused: the schema pins the command, the tool, and the arms.
         bad_documents = [
