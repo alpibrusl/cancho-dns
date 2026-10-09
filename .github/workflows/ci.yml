@@ -124,7 +124,7 @@ jobs:
 
       - name: Server authority is within the ceiling (gate 6)
         working-directory: dns
-        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho
 
       - name: Cache black-box tests (hits, TTLs, negative answers, 100,000 names inside a 1 MiB store)
         working-directory: dns
