@@ -193,3 +193,15 @@ jobs:
       - name: "The RFC coverage table is not stale (gate 30)"
         working-directory: dns
         run: python3 tests/conformance_test.py ../cancho/target/release/cancho
+
+      - name: "The whole-server fuzz (gate 31)"
+        working-directory: dns
+        run: python3 tests/fuzz_server.py build/server 5000 500
+
+      - name: "Every limit at its edge, slow clients, churn (gates 32, 34, 35)"
+        working-directory: dns
+        run: python3 tests/limits_test.py build/server
+
+      - name: "Amplification (gate 33)"
+        working-directory: dns
+        run: python3 tests/amplification_test.py build/server
