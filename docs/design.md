@@ -673,6 +673,22 @@ Not done in D8, said so.
 * Unbound and dnsmasq are installed by the CI step but the harness does not yet drive them (their forwarding configurations and the comparison are a follow-up slice; the harness's  is honest about it, and gate 30 checks the harness exists).
 * The command-line clients in CI: the same scenarios, by dnspython, are the client-side contract here; adding them where apt can reach them is a small follow-up on top of the scenarios gate 27 already fixed.
 
+## 21. D9, hardening: no input reaches a panic
+
+*Status: design; gates fixed now, code next.* Task [#13](https://github.com/alpibrusl/cancho-dns/issues/13): fuzz the codec and the whole server, test every resource limit at its edge, memory flat over churn, mutants of every bounds check killed, and the amplification story measured.
+
+**What is already gated** (said first, so this slice adds rather than repeats): the codec's exhaustive name sweep (every byte string of 0-6 bytes, gate 2), the one- and two-byte mutation fuzz of a real message (gate 1's harness, `--mutants`), the malformed-OPT and message-shape cases (gate 27), the misbehaving upstreams (gate 28), the rate limiter and the access list (gates 7-11), the memory bounds (gates 3 and 3b), and every refusal's mutants (gates across D1-D4). What this slice adds is the whole-server fuzz the gates do not cover: random streams against a *running* server over both transports, every limit at its edge in one place, and the amplification tests.
+
+**Gates, fixed now.**
+
+31. *The server fuzz* (`tests/fuzz_server.py`): a running server (UDP and TCP both open) receives N random byte strings of random lengths (0 to 4,100) and random byte distributions -- uniform, pointer-heavy (many `0xc0`), length-heavy (many 63s and 64s), and header-plausible (valid header counts with garbage after) -- plus every truncation of a valid query and every truncation of a valid reply, sent as datagrams and as TCP frames at random split points. A trap anywhere (the process dying) is the failure. The server must still answer a valid query afterwards. N is recorded with the result; the gate is a run of a fixed recorded length, not a fixed time.
+32. *Every limit at its edge* (`tests/limits_test.py`): connections at the cap (128) and one over (closed at accept); a TCP frame of exactly `frame_max()` (served) and two bytes over (closed); a query of `qmax()` bytes (forwarded) and one over (answered without forwarding); a message with the maximum record counts (64/16/32) parsed and refused shapes around them; the pending table at its cap (the next miss SERVFAILed, never queued past the cap); the cache at its key cap (evicting, gate 3's claim re-checked); the rate limiter at burst and one over (gate 8's edge, re-run here as one sweep).
+33. *Amplification* (`tests/amplification_test.py`): with the rate limiter on and a client under its bucket, an ANY query, a large-TXT query and a spoofed-source flood each produce answers no larger than the policy allows (a refusal is never larger than the query that earned it, D3b's rule re-checked at the flood), and the counters say what was dropped or refused.
+34. *Slow and abusive clients* (`tests/limits_test.py`, with the fuzz): a client that connects and sends nothing (closed at the idle timeout); a client that sends half a frame and stalls (same); a client that resets mid-reply (the reply is dropped, the slot freed, the next connection in the slot is not confused -- the generation counter's claim); 1,000 connections opened at once (the cap holds, the server alive).
+35. *Memory flat over churn* (`tests/limits_test.py`): a mixed run -- hits, misses, refusals, blocks, forwards, TCP and UDP -- for a fixed count, RSS at start and at end within 1%, plus a cold-start timing (process start to first answer) recorded.
+
+What this does not do: a coverage-guided fuzzer (the corpus is random and constructed, not guided; a guided one is a tooling slice), a formal memory-safety proof (the authority row is the claim that carries it), and the benchmark's stress cells (those are #14's, pre-registered in 8.1).
+
 ## Reproduce (section 2)
 
 ```
