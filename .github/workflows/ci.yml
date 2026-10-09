@@ -168,6 +168,6 @@ jobs:
         working-directory: dns
         run: python3 tests/mutate_local.py ../cancho/target/release/cancho python3
 
-      - name: The operator's surface (gates 18, 20 and 21: introspect, check, explain, diff, byte-stable)
+      - name: "The operator surface (gates 18, 20 and 21: introspect, check, explain, diff, byte-stable)"
         working-directory: dns
         run: python3 tests/agent_test.py build/server
