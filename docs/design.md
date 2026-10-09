@@ -579,7 +579,7 @@ What this does not do: the MCP front (optional in the issue; a separate slice on
 * **A bug the building found**: the first `diff` held two 64 KiB region slices at once and trapped reading the second file; one region at a time fixed it. And `json.put_fragment` traps on an empty string, so an authority report that is not embedded is printed as `null`, not crashed on.
 
 Not done in D6, said so.
-* The authority report in `introspect` is a placeholder; the manifest script (derive, embed, derive again at a fixed point) is a slice of its own, on the cancho-tools pattern.
+* ~~The authority report in `introspect` is a placeholder; the manifest script is a slice of its own.~~ **Done as D12 (a follow-up slice, `scripts/manifest.py`)**: pass 1 derives the report, `generated/built.cho` embeds it as string constants, pass 2 derives again with the generated file and requires the same report (a string constant adds no label, so the manifest describes the program that contains it), the ceiling gate runs inside the script, and `--check` also compares what the built binary's `introspect` prints with the fresh derivation. `manifests/server.authority.json` is the committed record. The report is **bounded**, with `fs_read("conf/")` and `io_write` as section 18 recorded.
 * The schema (`schemas/dns.v1.json`) is not published yet; the gates check the shape, not a schema file.
 * `diff` compares whole lines; a rename of a record is an add and a remove, which is honest but coarse.
 * The MCP front, the admin listener, `/readyz`, and errors as data on the startup path (the argument validation still exits with a bare code) are not in this slice.

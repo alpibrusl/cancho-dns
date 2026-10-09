@@ -81,9 +81,17 @@ jobs:
           python3 tests/gen_local.py local.conf /tmp/localtab.cho
           diff /tmp/localtab.cho src/localtab.cho
 
+      - name: The authority manifest (derive, embed, fixed point, ceiling)
+        working-directory: dns
+        run: |
+          python3 scripts/manifest.py
+          python3 scripts/manifest.py --check
+        env:
+          CANCHO: ../cancho/target/release/cancho
+
       - name: Build the server
         working-directory: dns
-        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho -o build/server
+        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho -o build/server
 
       - name: dnspython, the oracle of the differential test
         run: pip install dnspython
