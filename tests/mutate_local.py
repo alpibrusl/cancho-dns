@@ -9,7 +9,7 @@ ROOT = os.path.dirname(HERE)
 
 SRC = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho",
        "src/forward.cho", "src/limit.cho", "src/local.cho", "src/access.cho", "src/upstreams.cho",
-       "src/cli.cho", "src/rules.cho", "src/log.cho"]
+       "src/cli.cho", "src/rules.cho", "src/log.cho", "generated/built.cho"]
 
 # (file, old, new, what the mutant gets wrong)
 MUTANTS = [
@@ -47,6 +47,7 @@ def main():
     for path, old, new, why in MUTANTS:
         with tempfile.TemporaryDirectory() as d:
             shutil.copytree(os.path.join(ROOT, "src"), os.path.join(d, "src"))
+            shutil.copytree(os.path.join(ROOT, "generated"), os.path.join(d, "generated"))
             f = os.path.join(d, path)
             text = open(f).read()
             assert old in text, (path, old)

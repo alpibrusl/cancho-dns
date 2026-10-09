@@ -20,6 +20,7 @@ killed = 0
 for path, old, new, why in MUTANTS:
     with tempfile.TemporaryDirectory() as d:
         shutil.copytree(os.path.join(root, "src"), os.path.join(d, "src"))
+        shutil.copytree(os.path.join(root, "generated"), os.path.join(d, "generated"))
         f = os.path.join(d, path); text = open(f).read()
         assert text.count(old) >= 1, (path, old)
         open(f, "w").write(text.replace(old, new, 1))
@@ -27,7 +28,7 @@ for path, old, new, why in MUTANTS:
         cmd = [cancho, "build", "--std"]
         if backend:
             cmd += ["--backend", backend]
-        b = subprocess.run(cmd + ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/upstreams.cho", "src/limit.cho", "src/access.cho", "src/local.cho", "src/localtab.cho", "src/cli.cho", "src/rules.cho", "src/log.cho", "-o", "server"],
+        b = subprocess.run(cmd + ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/upstreams.cho", "src/limit.cho", "src/access.cho", "src/local.cho", "src/localtab.cho", "src/cli.cho", "src/rules.cho", "src/log.cho", "generated/built.cho", "-o", "server"],
                            cwd=d, capture_output=True, text=True)
         if b.returncode != 0:
             print("BUILD FAILED (mutant invalid):", why, b.stderr[-200:]); sys.exit(1)
