@@ -83,7 +83,7 @@ jobs:
 
       - name: Build the server
         working-directory: dns
-        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho -o build/server
+        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho -o build/server
 
       - name: dnspython, the oracle of the differential test
         run: pip install dnspython
@@ -116,7 +116,7 @@ jobs:
 
       - name: Server authority is within the ceiling (gate 6)
         working-directory: dns
-        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho
 
       - name: Cache black-box tests (hits, TTLs, negative answers, 100,000 names inside a 1 MiB store)
         working-directory: dns
@@ -167,3 +167,7 @@ jobs:
       - name: The local tests can fail (each deliberately wrong server is caught)
         working-directory: dns
         run: python3 tests/mutate_local.py ../cancho/target/release/cancho python3
+
+      - name: "The operator surface (gates 18, 20 and 21: introspect, check, explain, diff, byte-stable)"
+        working-directory: dns
+        run: python3 tests/agent_test.py build/server

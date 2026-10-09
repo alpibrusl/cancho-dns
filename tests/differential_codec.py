@@ -94,8 +94,9 @@ CASES = [
         "dns-bad-pointer",
         True,
     ),
-    ("17 pointer hops", hop_chain(17), "dns-bad-pointer", True),
-    # Both refuse.
+    # Both refuse. (The 17-hop pointer chain is not here: this gate pins nothing about the dnspython
+    # version, and one release added `PointerChainTooLong` and moved the case between the two columns;
+    # the hop limit itself is a unit test and a mutation variant, `tests/mutate_harness.py`.)
     ("OPT in the answers", hdr(an=1) + QUESTION + rr(b"\x00", 41, 1232, 0, b""), "dns-bad-edns", False),
     ("two OPTs", hdr(ar=2) + QUESTION + rr(b"\x00", 41, 1232, 0, b"") * 2, "dns-bad-edns", False),
     ("OPT owned by a pointer", hdr(ar=1) + QUESTION + rr(b"\xc0\x0c", 41, 1232, 0, b""), "dns-bad-edns", False),

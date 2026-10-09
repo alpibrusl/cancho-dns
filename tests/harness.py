@@ -4,7 +4,7 @@ import os, shutil, socket, subprocess, sys, tempfile, threading, time
 import dns.flags, dns.message, dns.query, dns.rcode, dns.rdataclass, dns.rdatatype, dns.rrset
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/limit.cho", "src/local.cho", "src/localtab.cho"]
+SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/limit.cho", "src/local.cho", "src/localtab.cho", "src/cli.cho", "src/rules.cho"]
 
 
 def free_udp_port():

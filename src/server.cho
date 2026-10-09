@@ -10,6 +10,8 @@ import rng;
 import forward;
 import upstreams;
 import limit;
+import cli;
+import std.bytes;
 import local;
 import access;
 import std.udps;
@@ -1098,10 +1100,70 @@ fn number_of[&t](text: &t [byte]) -> [] int {
     return n;
 }
 
+// The operator's surface, answered before anything is bound (`docs/design.md` section 18): `introspect`, `skill`,
+// `check`, `explain` and `diff` print and exit; anything else is a port and the server starts as before. The
+// entropy source is narrowed only on the server path, so these commands touch no file and no network.
+fn admin[&i, &a, &h, &c](io: &!i Io, args: &a Args, heap: &!h Heap, conf: &c Fs("conf/")) -> [io_write, heap, args, fs_read("conf/")] int {
+    let which = arg(args, 1);
+    if equal_text(which, "introspect") {
+        return cli.print(heap, io, cli.introspect(heap));
+    }
+    if equal_text(which, "skill") {
+        var b = cli.skill(heap);
+        borrow b as &r in {
+            io.write_all(io, buffer.bytes(r));
+        }
+        io.write_all(io, "\n");
+        buffer.drop(heap, b);
+        return 0;
+    }
+    if equal_text(which, "check") {
+        return cli.print(heap, io, cli.check(heap));
+    }
+    if equal_text(which, "explain") {
+        return cli.print(heap, io, cli.explain(heap, args));
+    }
+    if equal_text(which, "diff") {
+        return cli.print(heap, io, cli.diff(heap, args, conf));
+    }
+    return 0 - 1;
+}
+
+fn equal_text[&t](text: &t [byte], want: &static [byte]) -> [] bool {
+    return bytes.equal(text, want);
+}
+
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock } = split(world);
     release(ffi);
-    let urandom = narrow(fs, "/dev/urandom");
+    // The filesystem this program will ever touch: the entropy source, and (for `dns diff` only) the
+    // configuration directory. The report names both; a run-time path cannot narrow a capability, so `diff`'s
+    // files must live under `conf/` (`docs/design.md` section 18).
+    let (urandom, conf) = narrow(fs, "/dev/urandom", "conf/");
+    // The operator's surface: `introspect`, `skill`, `check`, `explain` and `diff` answer on standard output and
+    // exit, before anything is bound.
+    var answered = 0 - 1;
+    borrow args as &g in {
+        if arg_count(g) > 1 {
+            borrow conf as &c in {
+                borrow mut heap as &!h in {
+                    borrow mut io as &!i in {
+                        answered = admin(i, g, h, c);
+                    }
+                }
+            }
+        }
+    }
+    if answered >= 0 {
+        release(net);
+        release(clock);
+        release(conf);
+        release(urandom);
+        release(args);
+        release(io);
+        release(heap);
+        return answered;
+    }
     var port = 0 - 1;
     var idle = 10;
     var min_ttl = 10;
@@ -1186,6 +1248,7 @@ fn main(world: World) -> [] int {
         }
     }
     release(urandom);
+    release(conf);
     release(net);
     release(clock);
     release(args);

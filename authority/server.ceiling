@@ -6,6 +6,8 @@ conn_read
 conn_write
 err_write
 fs_read("/dev/urandom")
+fs_read("conf/")
+io_write
 heap
 net_in("")
 net_out("")
