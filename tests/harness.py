@@ -22,6 +22,7 @@ def build(cancho, upstream_ports, out, mutate=None, access_conf=None, local_tab=
     work = tempfile.mkdtemp(prefix="dnsbuild-")
     try:
         shutil.copytree(os.path.join(ROOT, "src"), os.path.join(work, "src"))
+        shutil.copytree(os.path.join(ROOT, "generated"), os.path.join(work, "generated"))
         conf = os.path.join(work, "upstreams.conf")
         with open(conf, "w") as f:
             f.write("".join("127.0.0.1 %d\n" % p for p in upstream_ports))

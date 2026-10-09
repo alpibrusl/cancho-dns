@@ -47,6 +47,7 @@ def main():
     for path, old, new, why in MUTANTS:
         with tempfile.TemporaryDirectory() as d:
             shutil.copytree(os.path.join(ROOT, "src"), os.path.join(d, "src"))
+            shutil.copytree(os.path.join(ROOT, "generated"), os.path.join(d, "generated"))
             f = os.path.join(d, path)
             text = open(f).read()
             assert old in text, (path, old)

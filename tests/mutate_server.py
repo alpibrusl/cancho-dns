@@ -20,6 +20,7 @@ killed = 0
 for path, old, new, why in MUTANTS:
     with tempfile.TemporaryDirectory() as d:
         shutil.copytree(os.path.join(root, "src"), os.path.join(d, "src"))
+        shutil.copytree(os.path.join(root, "generated"), os.path.join(d, "generated"))
         f = os.path.join(d, path); text = open(f).read()
         assert text.count(old) >= 1, (path, old)
         open(f, "w").write(text.replace(old, new, 1))
