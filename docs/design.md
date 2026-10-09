@@ -625,6 +625,40 @@ Not done in D7, said so.
 * A TCP client's queries are logged at the reply point with latency 0 (the synchronous path) and at the forwarded reply with the true latency, as UDP's are.
 * Sampled logging and per-client logs, as the design said.
 
+## 20. D8, conformance and interoperability
+
+*Status: design; gates fixed now, code next.* Task [#11](https://github.com/alpibrusl/cancho-dns/issues/11): automated tests against the built resolver with real clients and upstreams, an EDNS compliance checker, a differential against the incumbents, and a coverage table of the RFC statements v1 claims.
+
+**What is here, and what is deferred to a machine that has the incumbents.** The suite has three parts, and honesty about where each can run:
+
+* **A real client** is dnspython (the same oracle gate 1 uses): it speaks UDP and TCP, EDNS, and judges our replies the way a real stub resolver does. The classic command-line lookup tools (`d` + `ig`, `k` + `dig`) are not installable everywhere this project is tested (the CI runner can `apt-get` them; a locked-down host cannot), so the suite's client is dnspython and the CI step that has the tools runs them too; the scenarios are the same either way, because what is checked is the wire, not the client.
+* **A misbehaving upstream**: the scripted fake upstream of `tests/forward_server_test.py`, grown with the behaviours RFC 1035/7766 say a resolver must survive -- a reply with the wrong case, a reply with records the question did not ask for, a truncated reply without TC, a reply over the EDNS size, a TCP stream cut inside a frame, garbage bytes, and a silent upstream (already covered). The client must observe only what the design says: SERVFAIL or a retry, never a wrong answer and never a trap.
+* **A differential against Unbound and dnsmasq**: the same scenarios run against our resolver and against each incumbent, comparing what the client observes (RCODE, the answers' presence and types, TTL clamping, flags, truncation) and what the upstream receives. The harness (`tests/differential_resolver.py`) skips with a printed `SKIP` and a zero exit when a reference resolver is not installed, so it is a gate where the tools exist and an honest no-op where they do not; the CI job installs the incumbents and runs it as a gate there.
+
+**EDNS compliance.** The public EDNS compliance tests (the DNSTOOLS/yermetod list, as an `+edns` probe runs them) are scenarios a client can run against a resolver's *server side*: EDNS supported, payload size honoured, unknown options ignored, a malformed OPT, version 1 answered BADVERS, the DO bit passed through, a plain query without EDNS answered plainly. `tests/edns_test.py` runs each as a scripted query and checks our reply's shape -- the same cases the codec's unit tests check from the inside, here from the outside, by a client.
+
+**The RFC coverage table** (the issue asks for it; it is documentation, checked by the gates it links to):
+
+| RFC | statement v1 claims | where it is checked |
+|---|---|---|
+| 1034/1035 | the message format, one question, names of at most 255 bytes, labels at most 63, compression pointers backwards and at most 16 hops; FORMERR for what does not parse | gates 1 and 2 (the codec's fixtures and the six-byte sweep); `tests/edns_test.py` from the client side |
+| 1035 | REFUSED for a client outside the access list; REFUSED for opcode/class/type we do not serve | `tests/access_test.py`; `tests/server_test.py` |
+| 2181 (section 8) | a TTL with the top bit set is zero | gate 1's fixture (`tests/dns_test.cho`) |
+| 2308 | negative caching from the SOA MINIMUM, clamped | `tests/cache_test.cho` and `tests/cache_server_test.py` |
+| 6891 | one OPT, in the additional section, root owner, version 0; unknown options ignored not echoed; the advertised size bounds our replies | gates 1 and 2; `tests/edns_test.py` |
+| 7766 | TCP framing by the length prefix, idle timeout, one query per connection at a time, EDNS over TCP | `tests/server_test.py` (framing, order); `tests/forward_server_test.py` (TCP order) |
+| 8020 | 0x20 case randomisation on the forward, folded comparison on the reply | `tests/forward_test.cho`, `tests/spoof_test.py`, `tests/ports_test.py` |
+| 8767 | serve-stale: **not claimed** | -- |
+
+**Gates, fixed now.**
+
+27. *EDNS compliance from the client side* (`tests/edns_test.py`): each scenario's reply has the shape the RFC says (an OPT when the query had one and none when it did not, BADVERS for version 1, the advertised size respected, a malformed OPT answered FORMERR, unknown options ignored).
+28. *Misbehaving upstreams* (`tests/misbehaving_test.py`): each behaviour is answered with SERVFAIL or a retry, the client never sees a wrong answer, the resolver never dies, and the counters say which defence fired.
+29. *The differential* (`tests/differential_resolver.py`): where Unbound and dnsmasq are installed, the same scenarios give the same client observations on RCODE, answer presence, truncation and flags; where they are not, `SKIP` and exit 0. In CI the incumbents are installed and the gate is real.
+30. *The coverage table is not stale* (`tests/conformance_test.py`): every gate named in the table above exists and passes in the same run.
+
+What this does not do: the classic command-line clients as required clients (said above), serve-stale (8767, not claimed), QNAME minimisation (not in v1), and the incumbents' *performance* (that is #14's benchmark, with its own pre-registered cells).
+
 ## Reproduce (section 2)
 
 ```
