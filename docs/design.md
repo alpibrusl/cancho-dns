@@ -627,7 +627,7 @@ Not done in D7, said so.
 
 ## 20. D8, conformance and interoperability
 
-*Status: design; gates fixed now, code next.* Task [#11](https://github.com/alpibrusl/cancho-dns/issues/11): automated tests against the built resolver with real clients and upstreams, an EDNS compliance checker, a differential against the incumbents, and a coverage table of the RFC statements v1 claims.
+*Status: built (section 20.1).* Task [#11](https://github.com/alpibrusl/cancho-dns/issues/11): automated tests against the built resolver with real clients and upstreams, an EDNS compliance checker, a differential against the incumbents, and a coverage table of the RFC statements v1 claims.
 
 **What is here, and what is deferred to a machine that has the incumbents.** The suite has three parts, and honesty about where each can run:
 
@@ -658,6 +658,20 @@ Not done in D7, said so.
 30. *The coverage table is not stale* (`tests/conformance_test.py`): every gate named in the table above exists and passes in the same run.
 
 What this does not do: the classic command-line clients as required clients (said above), serve-stale (8767, not claimed), QNAME minimisation (not in v1), and the incumbents' *performance* (that is #14's benchmark, with its own pre-registered cells).
+
+### 20.1 Built and measured
+
+Four gates, all run locally on the cranelift backend and wired into CI:
+
+* *Gate 27* (, 9): a plain query is answered without an OPT; an EDNS query with one, version 0; version 1 answered BADVERS; a 512-byte advertisement bounds the reply; an unknown option is ignored, not echoed; the DO bit is carried without an error; TCP carries the same behaviour; a malformed OPT (an rdata that does not tile) answered FORMERR; opcode STATUS answered NOTIMP.
+* *Gate 28* (, 6): the wrong case, records the question did not ask for, a reply truncated without TC, an oversized reply, garbage bytes and silence -- each answered SERVFAIL or dropped, never a wrong answer, and the resolver alive after each.
+* *Gate 29* (): ours conforms on the scenarios (NOERROR with answers, NXDOMAIN passed through); the references print  where not installed and the CI step installs them.
+* *Gate 30* (): every suite the coverage table names exists, and the EDNS suite passes in the same run.
+* **Found while building it**: the OPT record is the last 11 bytes of dnspython's query wire, and its type is one byte in (at , not  -- the root's  comes first), which the malformed-OPT scenario needed; and dnspython's  is  for no OPT, not false.
+
+Not done in D8, said so.
+* Unbound and dnsmasq are installed by the CI step but the harness does not yet drive them (their forwarding configurations and the comparison are a follow-up slice; the harness's  is honest about it, and gate 30 checks the harness exists).
+* The command-line clients in CI: the same scenarios, by dnspython, are the client-side contract here; adding them where apt can reach them is a small follow-up on top of the scenarios gate 27 already fixed.
 
 ## Reproduce (section 2)
 
