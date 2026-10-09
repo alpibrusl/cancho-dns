@@ -67,6 +67,10 @@ pub fn errors_open[&h](heap: &!h Heap) -> [heap] Errors {
     return Errors { all: buffer.empty(heap, 256), count: 0, first_exit: 0 };
 }
 
+pub fn errors_count[&e](e: &e Errors) -> [] int {
+    return e.count;
+}
+
 pub fn errors_drop[&h](heap: &!h Heap, e: Errors) -> [heap] int {
     let Errors { all, count, first_exit } = e;
     buffer.drop(heap, all);
@@ -119,6 +123,7 @@ pub fn add[&h, &m](heap: &!h Heap, e: Errors, rule: &static [byte], message: &m 
 }
 
 // Print the collected errors as one JSON array and answer the exit code of the first.
+// Print the collected errors as one JSON object and drop them. Answers the exit code of the first.
 pub fn errors_print[&h, &i](heap: &!h Heap, io: &!i Io, e: Errors) -> [heap, io_write] int {
     let Errors { all, count, first_exit } = e;
     var b = buffer.empty(heap, 32);
