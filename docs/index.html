@@ -145,7 +145,7 @@ ul.why span { color: var(--muted); font-size: .95rem; }
 
 <section class="hero" style="padding-top:3.5rem">
   <div>
-    <p class="badge"><i></i>v1 built &middot; every gate green</p>
+    <a class="badge" href="#status"><i></i>v1 built &middot; we tried to break it before you run it</a>
     <h1>A DNS resolver you can audit.</h1>
     <p class="lead">A forwarding and caching resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code, no processes and no file but its entropy source.</p>
     <p class="sub">DNS is on every network, and its resolvers have a long history of memory-safety bugs in the code that parses packets. <code>cancho-dns</code> is the same job with no <code>Ffi</code> and no <code>unsafe</code>, and with limits that are checked, not hoped for.</p>
@@ -168,6 +168,12 @@ ul.why span { color: var(--muted); font-size: .95rem; }
 <section id="v1">
   <h2>What v1 does</h2>
   <p class="sub">A forwarding cache, built and gated: every claim below is measured, with its run recorded in the design document and the numbers file.</p>
+  <div class="stats">
+    <div><b>~146,000</b><span>queries/s answered on the cache-hit path, one loopback core</span></div>
+    <div><b>20,006</b><span>random datagrams fuzzed at the running server, no trap</span></div>
+    <div><b>0</b><span>bytes of file written, ever; the authority row says so and CI checks it</span></div>
+    <div><b>228 KB</b><span>the binary; listening ~8 ms after <code>exec</code></span></div>
+  </div>
   <div class="cols">
     <div><h3>In v1</h3><ul>
       <li>DNS over UDP and TCP, with EDNS0 and truncation</li>
@@ -200,6 +206,22 @@ net_in(""), net_out(""), fs_read("/dev/urandom"), fs_read("conf/")   # no ffi, n
   <p class="note">The open question has an answer, and it is not the one hoped for: measured on cancho, a network capability is narrowed once, its bound is read as <code>host:port</code> one way and as a port the other, and the host is matched by prefix, so a resolver that listens and dials cannot have its upstreams proven by the compiler today. The design ships v1 without that proof and files the language work it needs.</p>
 </section>
 
+<section id="proof">
+  <h2>We try to break it.</h2>
+  <p class="sub">The gates send what an attacker would send, before you ever do: random bytes, hostile names, forged replies, misbehaving upstreams, floods. Every number here is a run recorded in the design document.</p>
+  <div class="cols">
+    <div><h3>What it found</h3><ul>
+      <li>A question echo reading past a 32-byte message killed the server on the first <code>histogram.bind</code>. Fixed, and the gate that found it runs in CI.</li>
+      <li>The &ldquo;per-query memory leak&rdquo; was the arena&rsquo;s first touch, not a leak: <code>VmData</code> constant while RSS grew, then +0 over 750,000 queries. Issue #31, closed by the measurement.</li>
+      <li>A dnspython release began refusing 17-hop pointer chains, moving a differential case between the gate&rsquo;s own columns. The gate&rsquo;s &ldquo;the list cannot go stale&rdquo; rule fired; the case moved, with the reason.</li>
+    </ul></div>
+    <div><h3>What it disproved</h3><ul>
+      <li>That the compiler can prove which upstreams are reached: it cannot yet, so the set is compiled in and enforced in code, and the page says so.</li>
+      <li>That a resolver needs a second port for its metrics: <code>stats.bind</code> and <code>histogram.bind</code> answer on the DNS port, and the authority row stays narrow.</li>
+      <li>That ANY must be refused to bound amplification: a bounded answer and a counted bucket do it.</li>
+    </ul></div>
+  </div>
+</section>
 <section id="fit">
   <h2>Where it fits</h2>
   <p class="sub">The yardsticks are the resolvers people run. We will measure against them with the cells fixed before the code, and report losses as plainly as wins.</p>
@@ -219,7 +241,20 @@ net_in(""), net_out(""), fs_read("/dev/urandom"), fs_read("conf/")   # no ffi, n
 
 <section id="status">
   <h2>Status</h2>
-  <p class="sub"><strong>v1 is built and gated.</strong> Every task of the epic has its pull request, every gate is green in CI, and every number lives in the design document with its run. Stage 2 &mdash; DNSSEC validation and iterating from the root &mdash; is recorded as later work in the epic.</p>
+  <p class="sub"><strong>v1 is built and gated.</strong> Every task of the epic has its pull request, every gate is green in CI, and every number lives in the design document with its run.</p>
+  <div class="cols">
+    <div><h3>Not built yet</h3><ul>
+      <li>The incumbents&rsquo; benchmark ratio: Unbound, dnsmasq, CoreDNS and Knot Resolver are the yardsticks, the cells are pre-registered, and CI installs them &mdash; but no ratio is claimed here that was not measured on this host.</li>
+      <li>DNSSEC validation and iterating from the root (stage 2, recorded as later work in the epic).</li>
+      <li>DNS over TLS and HTTPS (TLS needs foreign code today, which would make the authority report unbounded).</li>
+      <li>Serve-stale (RFC 8767): not claimed; the coverage table in the design says so.</li>
+    </ul></div>
+    <div><h3>What is honestly limited</h3><ul>
+      <li>At most 128 TCP connections, 1,024 queries in flight, and the compiled-in tables are start-up facts: a change is a rebuild.</li>
+      <li>IPv4 only: cancho&rsquo;s sockets are IPv4; AAAA records are carried as data like any other.</li>
+      <li>The query log is off by default &mdash; a name is personal data &mdash; and on, it is one bounded line per query on standard error, no file.</li>
+    </ul></div>
+  </div>
 </section>
 
 </div></main>
