@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cancho-dns: a DNS resolver you can audit</title>
-<meta name="description" content="A forwarding and caching DNS resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code and no files but entropy. Design stage.">
+<meta name="description" content="A forwarding and caching DNS resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code and no files but entropy. v1 is built and gated.">
 <meta property="og:title" content="cancho-dns: a DNS resolver you can audit">
-<meta property="og:description" content="A bounded, capability-limited DNS resolver in cancho. Design stage: nothing is built yet.">
+<meta property="og:description" content="A bounded, capability-limited DNS resolver in cancho. v1 is built and gated: server, cache, forwarder, agent surface, conformance, hardening.">
 <meta property="og:image" content="https://alpibrusl.github.io/cancho-dns/assets/cancho-dns-logo-256.png">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" type="image/png" href="assets/cancho-dns-icon-64.png">
@@ -145,7 +145,7 @@ ul.why span { color: var(--muted); font-size: .95rem; }
 
 <section class="hero" style="padding-top:3.5rem">
   <div>
-    <p class="badge"><i></i>Design stage &middot; nothing is built yet</p>
+    <p class="badge"><i></i>v1 built &middot; every gate green</p>
     <h1>A DNS resolver you can audit.</h1>
     <p class="lead">A forwarding and caching resolver written in cancho: a bounded parser, a fixed arena, and an authority report that shows no foreign code, no processes and no file but its entropy source.</p>
     <p class="sub">DNS is on every network, and its resolvers have a long history of memory-safety bugs in the code that parses packets. <code>cancho-dns</code> is the same job with no <code>Ffi</code> and no <code>unsafe</code>, and with limits that are checked, not hoped for.</p>
@@ -166,16 +166,19 @@ ul.why span { color: var(--muted); font-size: .95rem; }
 </section>
 
 <section id="v1">
-  <h2>What v1 will do</h2>
-  <p class="sub">A forwarding cache first. Everything here is a plan, written down in the epic, and nothing is promised until it is built and measured.</p>
+  <h2>What v1 does</h2>
+  <p class="sub">A forwarding cache, built and gated: every claim below is measured, with its run recorded in the design document and the numbers file.</p>
   <div class="cols">
     <div><h3>In v1</h3><ul>
       <li>DNS over UDP and TCP, with EDNS0 and truncation</li>
       <li>A cache with TTLs, negative caching and LRU eviction in a fixed arena</li>
-      <li>Forwarding to a fixed set of upstream resolvers, with timeouts and health</li>
-      <li>Local records from a small bounded file, and overrides</li>
+      <li>Forwarding to a fixed set of upstream resolvers, with timeouts, retries and health</li>
+      <li>Local records, overrides and blocklists from a compiled-in file, closed by default</li>
       <li>Defences that matter: random transaction IDs and ports, 0x20 case randomisation, bailiwick checks, response rate limiting</li>
-      <li>Bounded JSON logs and metrics, with no files written</li>
+      <li>A query log on standard error, off by default, and a latency histogram at <code>histogram.bind</code></li>
+      <li>An operator surface before it binds: <code>introspect</code>, <code>skill</code>, <code>check</code>, <code>explain</code>, <code>diff</code>, errors as data, a published schema</li>
+      <li>Conformance gates: EDNS compliance from the client side, misbehaving upstreams survived, an RFC coverage table</li>
+      <li>Hardening gates: a 20,000-datagram whole-server fuzz with no trap, every limit at its edge, amplification bounded</li>
     </ul></div>
     <div class="no"><h3>Not in v1</h3><ul>
       <li>Iterating from the root servers (a later stage)</li>
@@ -188,10 +191,11 @@ ul.why span { color: var(--muted); font-size: .95rem; }
 
 <section id="built">
   <h2>How it is built</h2>
-  <p class="sub">One thread and one poller, as in the cache. This is the target row, not a measured one: it will be derived by <code>cancho authority</code> and checked in CI against a ceiling file, and it is what the design document has to settle first.</p>
+  <p class="sub">One thread and one poller, as in the cache. This is the measured row, derived by <code>cancho authority</code>, embedded in the binary at a fixed point, and checked in CI against a ceiling file: what <code>introspect</code> prints is what the compiler derives.</p>
   <div class="term" role="img" aria-label="The target authority row, a design aim"><div class="bar"><i></i><i></i><i></i></div>
-<pre><span class="c"># target, not built: what the compiler should report for the resolver</span>
-args, clock, heap, err_write, udp_recv, udp_send, conn_*, poll, net_in(""), net_out(""), fs_read("/dev/urandom")
+<pre><span class="c"># measured: what the compiler reports, embedded in introspect at a fixed point</span>
+args, clock, heap, err_write, io_write, udp_recv, udp_send, conn_accept, conn_read, conn_write, poll,
+net_in(""), net_out(""), fs_read("/dev/urandom"), fs_read("conf/")   # no ffi, no fs_write, no exec
 <span class="c"># no ffi, no fs_write, no exec; the upstream set is a table in code, not in the type</span></pre></div>
   <p class="note">The open question has an answer, and it is not the one hoped for: measured on cancho, a network capability is narrowed once, its bound is read as <code>host:port</code> one way and as a port the other, and the host is matched by prefix, so a resolver that listens and dials cannot have its upstreams proven by the compiler today. The design ships v1 without that proof and files the language work it needs.</p>
 </section>
@@ -205,7 +209,7 @@ args, clock, heap, err_write, udp_recv, udp_send, conn_*, poll, net_in(""), net_
     <div><h3>CoreDNS</h3><ul><li>Plugin-based, common in Kubernetes</li><li>Go, a different shape of tool</li></ul></div>
     <div><h3>Knot Resolver</h3><ul><li>Fast, validating, scripted</li><li>C and Lua</li></ul></div>
   </div>
-  <p class="note">Expectation, stated before measuring: a DNS packet is tiny, so throughput is limited by the kernel as much as by us. The honest aim is parity per core with much lower memory, and a security story the others cannot tell. A big speed win is not the claim.</p>
+  <p class="note">Expectation, stated before measuring &mdash; and now measured on ours, on one loopback host: ~146,000 queries/s on the cache-hit path, ~24,000/s over persistent TCP, p50 0.06&nbsp;ms, a 228&nbsp;KB binary ready in ~8&nbsp;ms, memory flat once warm (measured to the end: +0&nbsp;KiB over four consecutive 150,000-query rounds). The comparison against the resolvers above runs where they are installed &mdash; CI installs them &mdash; and no ratio is claimed here that was not measured. A big speed win is not the claim; losses will be reported as plainly as wins.</p>
 </section>
 
 <section id="plan">
@@ -215,7 +219,7 @@ args, clock, heap, err_write, udp_recv, udp_send, conn_*, poll, net_in(""), net_
 
 <section id="status">
   <h2>Status</h2>
-  <p class="sub"><strong>Design stage.</strong> There is a README, a logo and an epic with its tasks. There is no code, no benchmark and no claim beyond what is written above.</p>
+  <p class="sub"><strong>v1 is built and gated.</strong> Every task of the epic has its pull request, every gate is green in CI, and every number lives in the design document with its run. Stage 2 &mdash; DNSSEC validation and iterating from the root &mdash; is recorded as later work in the epic.</p>
 </section>
 
 </div></main>
