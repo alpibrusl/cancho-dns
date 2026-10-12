@@ -1,0 +1,238 @@
+edition 5;
+
+module logm;
+
+import std.buffer;
+import std.bytes;
+import dns;
+import rules;
+
+// `log` -- one bounded JSON line per query, on standard error, and the latency histogram
+// (`docs/design.md` section 19). No file effects: everything here is a buffer written to `err_write` or
+// counters in the caller's arena, so the authority row gains nothing.
+//
+// The line is at most 256 bytes whatever the name is: `qname` is expanded, lower-cased and truncated to 64
+// bytes, and a truncated name is shown with a leading `+` so a reader can tell. Query logging is off by
+// default; the server turns it on with an argument, and the reason is privacy (the design's words).
+
+pub fn line_max() -> [] int {
+    return 256;
+}
+
+pub fn name_max() -> [] int {
+    return 64;
+}
+
+// The histogram: 12 buckets, each the count of queries whose latency was at most its upper bound, plus the
+// sum of all latencies and the count of all queries. The bounds double; the last is everything over 1024 ms.
+pub fn buckets() -> [] int {
+    return 12;
+}
+
+// Bucket `i`'s upper bound in milliseconds (the last is "everything above 1024").
+pub fn bucket_bound(i: int) -> [] int {
+    if i >= buckets() - 1 {
+        return 0 - 1;
+    }
+    var n = 1;
+    var k = 0;
+    while k < i {
+        n = n * 2;
+        k = k + 1;
+    }
+    return n;
+}
+
+// The bucket a latency belongs to.
+pub fn bucket_of(ms: int) -> [] int {
+    var i = 0;
+    while i < buckets() - 1 {
+        if ms < bucket_bound(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return buckets() - 1;
+}
+
+// Prometheus's text for one bucket's upper bound: `1`, `2`, ... `+Inf`.
+pub fn bucket_label(i: int, out: &static [byte]) -> [] &static [byte] {
+    return out;
+}
+
+// How many bytes of text `name` is (labels joined by dots, no length bytes).
+fn text_len[&n](name: &n [byte]) -> [] int {
+    var total = 0;
+    var i = 0;
+    while i < len(name) && int_of(name[i]) != 0 {
+        total = total + int_of(name[i]);
+        i = i + 1 + int_of(name[i]);
+        if i < len(name) && int_of(name[i]) != 0 {
+            total = total + 1;
+        }
+    }
+    return total;
+}
+
+// The type by its mnemonic, for the line's `type` field.
+fn type_name(qtype: int) -> [] &static [byte] {
+    if qtype == 1 {
+        return "A";
+    }
+    if qtype == 28 {
+        return "AAAA";
+    }
+    if qtype == 5 {
+        return "CNAME";
+    }
+    if qtype == 12 {
+        return "PTR";
+    }
+    if qtype == 15 {
+        return "MX";
+    }
+    if qtype == 16 {
+        return "TXT";
+    }
+    if qtype == 33 {
+        return "SRV";
+    }
+    return "other";
+}
+
+// The JSON line for one answered query, into `out`, answering its length. `name` is the expanded question
+// name as `dns.name_expand` writes it; `latency` is milliseconds; `cache` is 1 for a hit, 0 for a miss, -1
+// when the question never reached the cache (a local answer, a refusal); `upstream` is the index of the
+// upstream it went to, or -1; `rule` is the refusal's catalogue entry, or -1. The line is at most `line_max()`
+// bytes whatever the name is.
+pub fn line[&o, &n](out: &!o [byte], name: &n [byte], qtype: int, rcode: int, cache: int, upstream: int, latency: int, rule: int) -> [] int {
+    // The whole line, written once: {"qname":"...","type":"A","rcode":0,"cache":"hit","upstream":...,
+    // "latency_ms":12,"rule":null}. Fixed fields first, the name last in the budget so the bound is easy.
+    var p = 0;
+    out[p] = byte_of('{');
+    p = p + 1;
+    // qname: expanded, folded, and truncated to name_max() bytes with a leading `+` when it was cut.
+    p = put_text(out, p, "\"qname\":\"");
+    // The name as text, from `dns.name_expand`'s length-prefixed labels, and truncated to name_max() bytes of
+    // *text* with a leading `+` when it was cut. The budget is fixed first, so a hostile name cannot grow the
+    // line: the bytes are counted, then written.
+    var budget = name_max();
+    var cut = false;
+    if text_len(name) > budget {
+        cut = true;
+        budget = budget - 1;
+    }
+    if cut {
+        out[p] = byte_of('+');
+        p = p + 1;
+    }
+    var i = 0;
+    var left = budget;
+    while i < len(name) && int_of(name[i]) != 0 {
+        let label = int_of(name[i]);
+        var k = 0;
+        while k < label && left > 0 {
+            let c = dns.fold(int_of(name[i + 1 + k]));
+            if c == '"' || c == '\\' {
+                out[p] = byte_of('\\');
+                p = p + 1;
+                out[p] = byte_of(c);
+            } else if c < 32 {
+                out[p] = byte_of('\\');
+                out[p + 1] = byte_of('u');
+                out[p + 2] = byte_of('0');
+                out[p + 3] = byte_of('0');
+                out[p + 4] = byte_of('0');
+                out[p + 5] = byte_of('0');
+                p = put_hex(out, p + 6, c);
+            } else {
+                out[p] = byte_of(c);
+            }
+            p = p + 1;
+            left = left - 1;
+            k = k + 1;
+        }
+        i = i + 1 + label;
+        if int_of(name[i]) != 0 && left > 0 {
+            out[p] = byte_of('.');
+            p = p + 1;
+            left = left - 1;
+        }
+    }
+    out[p] = byte_of('"');
+    p = p + 1;
+    p = put_text(out, p, ",\"type\":\"");
+    p = put_text(out, p, type_name(qtype));
+    out[p] = byte_of('"');
+    p = p + 1;
+    p = put_text(out, p, ",\"rcode\":");
+    p = put_nat(out, p, rcode);
+    p = put_text(out, p, ",\"cache\":\"");
+    if cache == 1 {
+        p = put_text(out, p, "hit");
+    } else if cache == 0 {
+        p = put_text(out, p, "miss");
+    } else {
+        p = put_text(out, p, "none");
+    }
+    out[p] = byte_of('"');
+    p = p + 1;
+    p = put_text(out, p, ",\"upstream\":");
+    if upstream < 0 {
+        p = put_text(out, p, "null");
+    } else {
+        p = put_nat(out, p, upstream);
+    }
+    p = put_text(out, p, ",\"latency_ms\":");
+    p = put_nat(out, p, latency);
+    p = put_text(out, p, ",\"rule\":");
+    if rule < 0 {
+        p = put_text(out, p, "null");
+    } else {
+        p = put_text(out, p, "\"");
+        p = put_text(out, p, rules.tag_of(rule));
+        out[p] = byte_of('"');
+        p = p + 1;
+    }
+    out[p] = byte_of('}');
+    p = p + 1;
+    return p;
+}
+
+fn put_text[&o, &s](out: &!o [byte], p: int, s: &s [byte]) -> [] int {
+    var k = 0;
+    while k < len(s) {
+        out[p + k] = s[k];
+        k = k + 1;
+    }
+    return p + len(s);
+}
+
+fn put_nat[&o](out: &!o [byte], p: int, n: int) -> [] int {
+    // At most 7 digits of a non-negative latency or rcode; the numbers here are all small.
+    var digits = 0;
+    var v = n;
+    if v == 0 {
+        out[p] = byte_of('0');
+        return p + 1;
+    }
+    var tmp = v;
+    while tmp > 0 {
+        digits = digits + 1;
+        tmp = tmp / 10;
+    }
+    var k = digits - 1;
+    while k >= 0 {
+        out[p + k] = byte_of('0' + v % 10);
+        v = v / 10;
+        k = k - 1;
+    }
+    return p + digits;
+}
+
+fn put_hex[&o](out: &!o [byte], p: int, c: int) -> [] int {
+    var hex = "0123456789abcdef";
+    out[p - 2] = hex[c / 16];
+    out[p - 1] = hex[c % 16];
+    return p;
+}

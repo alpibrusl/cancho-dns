@@ -584,6 +584,47 @@ Not done in D6, said so.
 * `diff` compares whole lines; a rename of a record is an add and a remove, which is honest but coarse.
 * The MCP front, the admin listener, `/readyz`, and errors as data on the startup path (the argument validation still exits with a bare code) are not in this slice.
 
+## 19. D7, logs and metrics with no files
+
+*Status: built (section 19.1).* Task [#12](https://github.com/alpibrusl/cancho-dns/issues/12): one bounded JSON line per query, counters and a latency histogram, **no file effects**.
+
+**Is cancho-log useful here? No, and this is the place to say why.** [cancho-log](https://github.com/alpibrusl/cancho-log) is a durable, segmented, append-only log: its `append` is a `file_write`, its `flush` is an `fsync`, its value is that what it was told is flushed survives a crash, and its recovery cuts a torn tail. Everything it does is a file effect, which is what this task forbids and what the authority claim ("no file is written") has said since D1. A resolver's query log is a *stream of observations for the operator*, not a record the operator is owed after a crash: a lost log line loses nothing the resolver promised. Where a durable event log *is* the right tool -- a stage-2 audit trail, or an event store behind task #17's decisions -- cancho-log is the engine to reach for, and this section is the record of that boundary.
+
+**The log line.** One JSON object per query, on **stderr** (the row already carries `err_write`; stdout is the CLI's, and a server's stdout is nobody's contract -- section 18 said so):
+
+    {"qname":"www.example.","type":"A","rcode":0,"cache":"miss","upstream":"127.0.0.1","latency_ms":12,"rule":null}
+
+* `qname` is expanded, lower-cased, and **truncated to 64 bytes with a leading `+`** (a hostile name cannot grow the line); query logging is off by default and turned on with a 9th argument (`on`/`off`), because a name is personal data and the default is silence.
+* `rule` is the refusal's tag (`introspect` lists them all) when the query was refused, else `null`.
+* One line, bounded: the whole line is at most 256 bytes whatever the name, and the bound has a gate.
+* The counters are **not** in the line; they are `stats.bind`'s, as they were.
+
+**The histogram.** A latency histogram is counters in `Core` -- 12 buckets (0-1, 1-2, 2-4, 4-8, 8-16, 16-32, 32-64, 64-128, 128-256, 256-512, 512-1024, over 1024 ms), fixed at start, nothing allocated -- and a new `histogram.bind TXT` (class CH, like `stats.bind`) answers them as `dns_latency_bucket{le="..."} N ... dns_latency_sum N dns_latency_count N` in Prometheus text format. **No separate listener**: section 18 decided the admin surface is the DNS port; a second listener widens the row and the attack surface, and the issue's "separate bounded listener" is recorded here as *not taken*, with the reason. `introspect` names the histogram's buckets.
+
+**Gates, fixed now.**
+
+23. *The bound holds under hostile names* (`tests/log_test.py`): with logging on, queries with a 255-byte name, a 63-byte label, a name of 63 one-byte labels, and random case each answer and produce a line of at most 256 bytes; logging off produces no line.
+24. *Counters equal an independent count* (`tests/log_test.py`): a scripted run of N queries (a mix: cached, forwarded, refused, blocked) is counted by the test itself, and `stats.bind`'s counters and the histogram's `count` equal the independent count exactly.
+25. *The line says what happened* (`tests/log_test.py`): a cache hit logs `cache:"hit"` with no upstream; a forwarded query logs the upstream it went to; a local record logs `rule:"local"`; a block logs `rule:"acl-refused"` (or the drop is a counter with no line, as D3b said); a refused query logs the rule's tag.
+26. *Authority*: the ceiling gains nothing (stderr is `err_write`, already in the row; the histogram is counters in the arena).
+
+What this does not do: file logging (cancho-log, said above), a separate metrics listener (said above), sampled or rate-limited logging (every query is one line when on; the rate limiter already bounds the work), and per-client logs.
+
+### 19.1 Built and measured
+
+`src/log.cho` (the bounded line: the name as dotted text from `dns.name_expand`'s wire form, folded, truncated to 64 bytes of text with a leading `+`; the type by its mnemonic; the rcode; hit/miss/none; the upstream or `null`; the latency; the rule tag or `null`) and the wiring in `src/server.cho`: a 9th argument `on`/`off` (off by default), `note_query` at the reply points (the synchronous UDP and TCP replies at latency 0, the forwarded reply at `now - <queued at>`, kept in a 13th pending-row field), and `histogram.bind. CH TXT` answering the Prometheus text.
+
+* *Gate 23* (`tests/log_test.py`): a 63-byte label, a name of twenty ten-byte labels, and mixed case each answer and produce a line of at most 256 bytes, each a valid JSON object; with logging off, standard error after `listening` is empty.
+* *Gate 24*: the histogram's `count` and the log lines are two independent counts of the same answered queries; their deltas over a fixed number of asks agree exactly.
+* *Gate 25*: a local record logs `cache:none` and no upstream, and is never cached (the same name again is still `none`); a stub miss logs `miss` then `hit`; a block logs rcode 3.
+* *Gate 26*: the authority ceiling is unchanged -- `err_write` was already in the row, and the histogram is counters in the arena.
+* **Bugs the building found**: the first `histogram_reply` echoed the question to `header + 32` bytes, reading past a 32-byte message (a trap, and the server died on its first `histogram.bind`); the TXT rdata needed per-string length bytes and the first in-place chop copied forward over its own source; both are fixed (the chop runs last-chunk-first, high bytes first, so every write lands above its own read). And `put_nat` of a negative upstream printed nothing -- an absent upstream is `null` now.
+
+Not done in D7, said so.
+* The line's `upstream` is the index, not the address: `introspect`'s upstream list gives the address for the index.
+* A TCP client's queries are logged at the reply point with latency 0 (the synchronous path) and at the forwarded reply with the true latency, as UDP's are.
+* Sampled logging and per-client logs, as the design said.
+
 ## Reproduce (section 2)
 
 ```

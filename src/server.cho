@@ -11,6 +11,7 @@ import forward;
 import upstreams;
 import limit;
 import cli;
+import logm;
 import std.bytes;
 import local;
 import access;
@@ -96,8 +97,9 @@ fn max_pending() -> [] int {
 //     9  the length of the query as sent, kept in `sbuf[smax() * i ..]`
 //    10  the generation of the client's connection (TCP)
 //    11  the upstream to avoid on the next attempt, or -1
+//    12  when it was queued, in milliseconds (`docs/design.md` section 19: the latency of a forwarded query)
 fn pstride() -> [] int {
-    return 12;
+    return 13;
 }
 
 fn qmax() -> [] int {
@@ -188,6 +190,10 @@ res struct Core {
     limiter: limit.Limiter,
     // The 19 bytes `udp_peer` writes a sender into.
     peerbuf: Box[[byte]],
+    // The latency histogram (`docs/design.md` section 19): 12 buckets, the sum, the count.
+    hist: Box[[int]],
+    // The log line, built here and written to standard error (`docs/design.md` section 19).
+    lineb: Box[[byte]],
 }
 
 // ---------------------------------------------------------------------
@@ -198,7 +204,158 @@ res struct Core {
 // the client can take; TCP does not. A question the resolver can answer is looked up in the cache first; on a miss the stub (the
 // upstream, until there is a forwarder) answers into `up`, the reply goes through `cache.insert` exactly as a forwarded one will, and
 // the client is served from the entry; a reply that is not cacheable (a refusal, no SOA) is sent as it is.
-fn handle[&d, &t, &o, &k, &u, &v, &l, &s](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int, forwarding: bool, locals: &l local.Local, scratch: &!s [byte]) -> [] int {
+// Is the parsed query `histogram.bind. CH TXT`?
+fn is_histogram[&d, &t](data: &d [byte], table: &t [int]) -> [] bool {
+    if table[7] != 16 || table[8] != 3 {
+        return false;
+    }
+    // histogram.bind. on the wire is 9 h i s t o g r a m, 4 b i n d, 0: sixteen bytes after the header.
+    if dns.name_end(data, dns.header_size()) != dns.header_size() + 16 {
+        return false;
+    }
+    return equal_wire(data, 12, "histogram") && equal_wire(data, 22, "bind");
+}
+
+// Does the label at  `at`  in  `data`  equal  `text` , ignoring case?
+fn equal_wire[&d, &s](data: &d [byte], at: int, text: &s [byte]) -> [] bool {
+    if int_of(data[at]) != len(text) {
+        return false;
+    }
+    var k = 0;
+    while k < len(text) {
+        if dns.fold(int_of(data[at + 1 + k])) != dns.fold(int_of(text[k])) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The latency histogram as one TXT record of Prometheus text (`docs/design.md` section 19): one
+// `dns_latency_bucket{le="..."} N` per bucket, then the sum and the count.
+fn histogram_reply[&o, &q, &t, &g](out: &!o [byte], query: &q [byte], table: &t [int], hist: &!g [int]) -> [] int {
+    if len(out) < 1024 {
+        return dns.error_no_room();
+    }
+    var p = dns.put16(out, 0, table[0]);
+    p = dns.put16(out, p, 32768 + table[1] / 256 % 2 * 256 + 128);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 0);
+    p = dns.put16(out, p, 0);
+    var k = dns.header_size();
+    while k < 32 {
+        out[k] = query[k];
+        k = k + 1;
+    }
+    p = 32;
+    p = dns.put16(out, p, 49164);
+    p = dns.put16(out, p, 16);
+    p = dns.put16(out, p, 3);
+    p = dns.put32(out, p, 0);
+    let rdlen = p;
+    // The text is written after the length, then chopped into TXT strings of at most 255 bytes as it is
+    // copied back over the placeholder (a TXT string is one length byte and at most 255 of text).
+    let text_at = p + 2;
+    var t = text_at;
+    var i = 0;
+    while i < logm.buckets() {
+        t = put_text_of(out, t, "dns_latency_bucket{le=\"");
+        if i == logm.buckets() - 1 {
+            t = put_text_of(out, t, "+Inf");
+        } else {
+            t = put_nat_of(out, t, logm.bucket_bound(i));
+        }
+        t = put_text_of(out, t, "\"} ");
+        t = put_nat_of(out, t, hist[i]);
+        t = put_text_of(out, t, "\n");
+        i = i + 1;
+    }
+    t = put_text_of(out, t, "dns_latency_sum ");
+    t = put_nat_of(out, t, hist[logm.buckets()]);
+    t = put_text_of(out, t, "\ndns_latency_count ");
+    t = put_nat_of(out, t, hist[logm.buckets() + 1]);
+    // Chop the text into TXT strings of at most 255 bytes, in place, backwards: chunk i's data moves
+    // to its place at source offset + i (one length byte per string before it), and the chunks are
+    // processed last to first with each copied high-to-low, so every write lands above its own read and
+    // below everything already written.
+    var total = t - text_at;
+    var strings = (total + 254) / 255;
+    var i = strings - 1;
+    while i >= 0 {
+        var src_at = 255 * i;
+        var chunk = total - src_at;
+        if chunk > 255 {
+            chunk = 255;
+        }
+        var c = chunk - 1;
+        while c >= 0 {
+            out[text_at + src_at + i + 1 + c] = out[text_at + src_at + c];
+            c = c - 1;
+        }
+        out[text_at + src_at + i] = byte_of(chunk);
+        i = i - 1;
+    }
+    let w_at = text_at + total + strings;
+    dns.put16(out, rdlen, w_at - rdlen - 2);
+    return w_at;
+}
+
+fn put_text_of[&o, &s](out: &!o [byte], p: int, s: &s [byte]) -> [] int {
+    var k = 0;
+    while k < len(s) {
+        out[p + k] = s[k];
+        k = k + 1;
+    }
+    return p + len(s);
+}
+
+fn put_nat_of[&o](out: &!o [byte], p: int, n: int) -> [] int {
+    if n == 0 {
+        out[p] = byte_of('0');
+        return p + 1;
+    }
+    var digits = 0;
+    var tmp = n;
+    while tmp > 0 {
+        digits = digits + 1;
+        tmp = tmp / 10;
+    }
+    var k = digits - 1;
+    var v = n;
+    while k >= 0 {
+        out[p + k] = byte_of('0' + v % 10);
+        v = v / 10;
+        k = k - 1;
+    }
+    return p + digits;
+}
+
+// Note one answered query: the histogram always, the line on standard error when `querylog` is on
+// (`docs/design.md` section 19). `qdata` is the client's query, parsed into `table`; `rcode` is the reply's;
+// `cache_hit` is 1 for a hit, 0 for a miss, -1 when the cache was never asked (a local answer, a refusal);
+// `upstream` is the index the query went to or -1; `latency` is milliseconds; `rule` is the refusal's
+// catalogue entry or -1.
+fn note_query[&c, &q, &t, &i](core: &!c Core, io: &!i Io, qdata: &q [byte], table: &t [int], rcode: int, cache_hit: int, upstream: int, latency: int, rule: int, querylog: bool) -> [err_write] int {
+    let hist = contents(core.hist);
+    let b = logm.bucket_of(latency);
+    hist[b] = hist[b] + 1;
+    hist[logm.buckets()] = hist[logm.buckets()] + latency;
+    hist[logm.buckets() + 1] = hist[logm.buckets() + 1] + 1;
+    if querylog {
+        let name_len = dns.name_expand(qdata, table[6], contents(core.lname));
+        if name_len > 0 {
+            let n = logm.line(contents(core.lineb), contents(core.lname)[0..name_len], table[7], rcode, cache_hit, upstream, latency, rule);
+            io.error_all(io, contents(core.lineb)[0..n]);
+            io.error_all(io, "\n");
+        }
+    }
+    return 0;
+}
+
+fn handle[&d, &t, &o, &k, &u, &v, &l, &s, &m, &g](data: &d [byte], table: &!t [int], out: &!o [byte], udp: bool, answers: &!k cache.Cache, up: &!u [byte], ut: &!v [int], now: int, forwarding: bool, locals: &l local.Local, scratch: &!s [byte], meta: &!m [int], core_hist: &!g [int]) -> [] int {
+    meta[3] = 0 - 1;
     if dns.is_response(data) {
         return 0;
     }
@@ -211,6 +368,10 @@ fn handle[&d, &t, &o, &k, &u, &v, &l, &s](data: &d [byte], table: &!t [int], out
     }
     if cache.is_stats(data, table) {
         return cache.stats_reply(answers, data, table, out);
+    }
+    if is_histogram(data, table) {
+        let n = histogram_reply(out, data, table, core_hist);
+        return n;
     }
     // The compiled-in local table is asked first (`docs/design.md` section 17): a match answers here and is never
     // cached and never forwarded, so an `override` beats a cached answer and a `block` never reaches an upstream.
@@ -231,8 +392,10 @@ fn handle[&d, &t, &o, &k, &u, &v, &l, &s](data: &d [byte], table: &!t [int], out
     if asks_cache {
         let hit = cache.lookup(answers, now, data, table, out, limit);
         if hit > 0 {
+            meta[3] = 1;
             return hit;
         }
+        meta[3] = 0;
         if forwarding {
             // A miss with an upstream: the caller queues the query and the answer comes when the upstream's does.
             return 0 - 1;
@@ -258,7 +421,7 @@ fn handle[&d, &t, &o, &k, &u, &v, &l, &s](data: &d [byte], table: &!t [int], out
 // Take a slot in the pending table for a query that has to go upstream, keeping a copy of it. `kind` and `client` say who is
 // waiting (a datagram's ticket, or a TCP connection's slot with its `generation`). Answers the index, or -1 if the table is full or
 // the query is longer than is kept; the caller then answers SERVFAIL itself.
-fn begin[&p, &q, &m, &d](pend: &!p [int], qbuf: &!q [byte], meta: &!m [int], data: &d [byte], kind: int, client: int, generation: int) -> [] int {
+fn begin[&p, &q, &m, &d](pend: &!p [int], qbuf: &!q [byte], meta: &!m [int], data: &d [byte], kind: int, client: int, generation: int, now: int) -> [] int {
     if len(data) > qmax() {
         return 0 - 1;
     }
@@ -286,6 +449,7 @@ fn begin[&p, &q, &m, &d](pend: &!p [int], qbuf: &!q [byte], meta: &!m [int], dat
     pend[b + 9] = 0;
     pend[b + 10] = generation;
     pend[b + 11] = 0 - 1;
+    pend[b + 12] = now;
     var k = 0;
     while k < len(data) {
         qbuf[qmax() * found + k] = data[k];
@@ -322,7 +486,7 @@ fn ipv4_in[&r](raw: &r [byte]) -> [] int {
 // ---------------------------------------------------------------------
 
 // Read and answer the datagrams waiting, up to the burst.
-fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_send] int {
+fn serve_udp[&u, &c, &i](sock: &!u Udp, core: &!c Core, io: &!i Io, now: int, querylog: bool) -> [udp_recv, udp_send, err_write] int {
     let tb = contents(core.table);
     let sc = contents(core.scratch);
     let dg = contents(core.datagram);
@@ -357,9 +521,9 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
                         }
                     }
                 } else {
-                    let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname));
+                    let sent = handle(dg[0..n], tb, sc, true, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname), contents(core.meta), contents(core.hist));
                     if sent == 0 - 1 {
-                        if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0) < 0 {
+                        if begin(contents(core.pend), contents(core.qbuf), contents(core.meta), dg[0..n], 0, who[0], 0, now) < 0 {
                             let failed = dns.encode_error(sc, dg[0..n], tb, 2, stub.udp_ceiling());
                             if failed > 0 {
                                 udp_send_to(sock, sc[0..failed], who[0]);
@@ -367,6 +531,7 @@ fn serve_udp[&u, &c](sock: &!u Udp, core: &!c Core, now: int) -> [udp_recv, udp_
                         }
                     } else if sent > 0 {
                         udp_send_to(sock, sc[0..sent], who[0]);
+                        note_query(core, io, dg[0..n], tb, dns.u16_at(sc[0..sent], 2) % 16, contents(core.meta)[3], 0 - 1, 0, 0 - 1, querylog);
                     }
                 }
             }
@@ -470,10 +635,10 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, now: int) -> [c
                 going = false;
             } else {
                 let view = bf[base + used + 2..base + used + 2 + size];
-                var n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname));
+                var n = handle(view, tb, sc[2..len(sc)], false, core.answers, up, ut, now, upstreams.count() > 0, core.locals, contents(core.lname), contents(core.meta), contents(core.hist));
                 if n == 0 - 1 {
                     // It has to go upstream: this connection waits for the answer before its next message is read.
-                    let slot = begin(contents(core.pend), contents(core.qbuf), contents(core.meta), view, 1, k, st[p + 7]);
+                    let slot = begin(contents(core.pend), contents(core.qbuf), contents(core.meta), view, 1, k, st[p + 7], now);
                     if slot >= 0 {
                         st[p + 6] = slot + 1;
                         going = false;
@@ -835,7 +1000,7 @@ fn launch_pending[&h, &n, &t, &u, &c](heap: &!h Heap, nn: &n Net(""), socks: con
 
 // The reply in `rbuf[0..n]` came on the socket of pending query `i`. Answers whether it was the answer: if so the query is finished
 // (cached, delivered, freed); if not it is counted and dropped, and the query goes on waiting for the real one.
-fn take_reply[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, i: int, n: int, now: int) -> [udp_send, conn_write, poll] bool {
+fn take_reply[&t, &s, &u, &c, &i2](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, io: &!i2 Io, querylog: bool, i: int, n: int, now: int) -> [udp_send, conn_write, poll, err_write] bool {
     let pend = contents(core.pend);
     let qb = contents(core.qbuf);
     let sb = contents(core.sbuf);
@@ -880,6 +1045,7 @@ fn take_reply[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock
     if len_out > 0 {
         more = deliver(tab, sock, core, i, len_out, now);
         release_query(socks, core, i);
+        note_query(core, io, q, tb, dns.u16_at(sc[2..len(sc)], 4) % 16, 1, pend[b + 6], now - pend[b + 12], 0 - 1, querylog);
     } else {
         more = fail_query(tab, sock, core, i, now);
         release_query(socks, core, i);
@@ -892,7 +1058,7 @@ fn take_reply[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock
 
 // The poller said the socket of pending query `i` is readable: read what is there (a few datagrams at most), keeping the first that
 // is the answer.
-fn on_upstream[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, i: int, now: int) -> [udp_recv, udp_send, conn_write, poll] int {
+fn on_upstream[&t, &s, &u, &c, &i](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!u Udp, core: &!c Core, io: &!i Io, querylog: bool, i: int, now: int) -> [udp_recv, udp_send, conn_write, poll, err_write] int {
     var turns = 0;
     var more = true;
     while more && turns < 8 {
@@ -903,7 +1069,7 @@ fn on_upstream[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, soc
         }
         match udps.recv(socks, contents(core.pend)[b + 8], contents(core.rbuf)) {
             Datagram::Got(n) => {
-                if take_reply(tab, socks, sock, core, i, n, now) {
+                if take_reply(tab, socks, sock, core, io, querylog, i, n, now) {
                     more = false;
                 }
             }
@@ -966,7 +1132,7 @@ fn expire[&t, &s, &u, &c](tab: &!t conns.Table, socks: &!s conns.Table, sock: &!
 // The loop
 // ---------------------------------------------------------------------
 
-fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Listener, sock: &!u Udp, clock: &k Clock, seed: &s [byte], idle: int, memory: int, keys: int, min_ttl: int, rate: int, burst: int) -> [heap, net_out(""), conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock] int {
+fn run[&h, &l, &u, &k, &n, &s, &i](heap: &!h Heap, nn: &n Net(""), listener: &!l Listener, sock: &!u Udp, clock: &k Clock, seed: &s [byte], io: &!i Io, idle: int, memory: int, keys: int, min_ttl: int, rate: int, burst: int, querylog: bool) -> [heap, net_out(""), conn_accept, conn_read, conn_write, udp_recv, udp_send, poll, clock, err_write] int {
     match poller_new() {
         Polling::Ok(p) => {
             var poller = p;
@@ -983,7 +1149,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
                 hash_seed = rng.u32(rw);
                 limit_key = rng.u32(rw);
             }
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), locals: local.open(heap), lname: box_slice(heap, 256, byte_of(0)), limiter: limit.open(heap, rate, burst, limit_key), peerbuf: box_slice(heap, 19, byte_of(0)) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * limit, 0), bufs: box_slice(heap, limit * input_size(), byte_of(0)), pends: box_slice(heap, limit * output_size(), byte_of(0)), table: box_slice(heap, dns.slots(), 0), scratch: box_slice(heap, 2 + stub.largest(), byte_of(0)), datagram: box_slice(heap, 4096, byte_of(0)), who: box_slice(heap, 1, 0), answers: cache.open(heap, memory, keys, hash_seed, min_ttl), upstream: box_slice(heap, stub.largest(), byte_of(0)), utable: box_slice(heap, dns.slots(), 0), rnd: rnd0, pend: box_slice(heap, pstride() * max_pending(), 0), qbuf: box_slice(heap, qmax() * max_pending(), byte_of(0)), sbuf: box_slice(heap, smax() * max_pending(), byte_of(0)), nbuf: box_slice(heap, 256, byte_of(0)), rbuf: box_slice(heap, 4096, byte_of(0)), health: box_slice(heap, 16, 0), meta: box_slice(heap, 4, 0), locals: local.open(heap), lname: box_slice(heap, 256, byte_of(0)), limiter: limit.open(heap, rate, burst, limit_key), peerbuf: box_slice(heap, 19, byte_of(0)), hist: box_slice(heap, logm.buckets() + 2, 0), lineb: box_slice(heap, logm.line_max(), byte_of(0)) };
             var tab = conns.empty(heap, 64);
             var socks = conns.empty(heap, 64);
             while true {
@@ -1012,13 +1178,13 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
                         }
                     } else if token == 1 {
                         borrow mut core as &!cw in {
-                            serve_udp(sock, cw, now);
+                            serve_udp(sock, cw, io, now, querylog);
                         }
                     } else if token >= up_token() {
                         borrow mut tab as &!tw in {
                             borrow mut socks as &!sw in {
                                 borrow mut core as &!cw in {
-                                    on_upstream(tw, sw, sock, cw, token - up_token(), now);
+                                    on_upstream(tw, sw, sock, cw, io, querylog, token - up_token(), now);
                                 }
                             }
                         }
@@ -1050,7 +1216,7 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             }
             conns.drop(heap, tab);
             udps.drop(heap, socks);
-            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, locals, lname, limiter, peerbuf } = core;
+            let Core { poller, events, state, bufs, pends, table, scratch, datagram, who, answers, upstream, utable, rnd, pend, qbuf, sbuf, nbuf, rbuf, health, meta, locals, lname, limiter, peerbuf, hist, lineb } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -1074,6 +1240,8 @@ fn run[&h, &l, &u, &k, &n, &s](heap: &!h Heap, nn: &n Net(""), listener: &!l Lis
             local.close(heap, locals);
             unbox_slice(heap, lname);
             unbox_slice(heap, peerbuf);
+            unbox_slice(heap, hist);
+            unbox_slice(heap, lineb);
             unbox_slice(heap, utable);
             return 0;
         }
@@ -1171,6 +1339,8 @@ fn main(world: World) -> [] int {
     var keys = 65536;
     var rate = 1000;
     var burst = 2000;
+    // Query logging is off by default: a name is personal data (`docs/design.md` section 19).
+    var querylog = false;
     borrow args as &g in {
         if arg_count(g) > 1 {
             port = number_of(arg(g, 1));
@@ -1193,6 +1363,11 @@ fn main(world: World) -> [] int {
         if arg_count(g) > 7 {
             burst = number_of(arg(g, 7));
         }
+        if arg_count(g) > 8 {
+            if equal_text(arg(g, 8), "on") {
+                querylog = true;
+            }
+        }
     }
     var status = 2;
     if port > 0 && port < 65536 && idle > 0 && idle < 86400 && min_ttl > 0 && min_ttl <= 3600 && memory >= 65536 && keys >= 16 && rate >= 0 && burst >= 1 && burst < 1000000 {
@@ -1209,15 +1384,6 @@ fn main(world: World) -> [] int {
                                 borrow mut sock as &!uh in {
                                     udp_nonblocking(uh);
                                     borrow mut heap as &!h in {
-                                        borrow mut io as &!i in {
-                                            var line = buffer.append(h, buffer.empty(h, 64), "listening on ");
-                                            line = buffer.push_nat(h, line, port);
-                                            line = buffer.push(h, line, byte_of(10));
-                                            borrow line as &lb in {
-                                                io.error_all(i, buffer.bytes(lb));
-                                            }
-                                            buffer.drop(h, line);
-                                        }
                                         borrow clock as &c in {
                                             region r {
                                                 let entropy = alloc_slice[r](32, byte_of(0));
@@ -1226,7 +1392,16 @@ fn main(world: World) -> [] int {
                                                     got = fs_read(ur, "/dev/urandom", entropy);
                                                 }
                                                 if got == 32 {
-                                                    status = run(h, nn, lh, uh, c, entropy, idle * 1000, memory, keys, min_ttl, rate, burst);
+                                                    borrow mut io as &!i in {
+                                                        var line = buffer.append(h, buffer.empty(h, 64), "listening on ");
+                                                        line = buffer.push_nat(h, line, port);
+                                                        line = buffer.push(h, line, byte_of(10));
+                                                        borrow line as &lb in {
+                                                            io.error_all(i, buffer.bytes(lb));
+                                                        }
+                                                        buffer.drop(h, line);
+                                                        status = run(h, nn, lh, uh, c, entropy, i, idle * 1000, memory, keys, min_ttl, rate, burst, querylog);
+                                                    }
                                                 } else {
                                                     status = 5;
                                                 }
