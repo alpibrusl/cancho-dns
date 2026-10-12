@@ -1,0 +1,431 @@
+edition 5;
+
+module local;
+
+import std.map;
+import dns;
+import localtab;
+
+// `local` -- the compiled-in local records, overrides and blocklists (`docs/design.md` section 17). The generated
+// `localtab` holds one directive per line: `kind rtype name-length data-length` then the name's bytes then the data's,
+// all as decimal fields separated by single spaces. This module parses it once at start into two fixed arenas and
+// answers queries from it. A match is answered here and never cached and never forwarded; the table is asked before
+// the cache, so an `override` beats a cached answer too.
+
+pub fn max_entries() -> [] int {
+    return 512;
+}
+
+// A name as `dns.name_expand` writes it: a length byte per label, then 0. At most 256 bytes.
+pub fn name_room() -> [] int {
+    return 256;
+}
+
+// The most rdata one directive can carry (a TXT of 255 bytes with its length byte, or an SRV of numbers and a name).
+pub fn data_room() -> [] int {
+    return 260;
+}
+
+pub fn record() -> [] int {
+    return 0;
+}
+
+pub fn override() -> [] int {
+    return 1;
+}
+
+pub fn block_nx() -> [] int {
+    return 2;
+}
+
+pub fn block_a() -> [] int {
+    return 3;
+}
+
+pub fn ttl() -> [] int {
+    return 30;
+}
+
+pub res struct Local {
+    // Per directive: 0 kind, 1 rtype, 2 name offset, 3 name length, 4 data offset, 5 data length.
+    rows: Box[[int]],
+    names: Box[[byte]],
+    data: Box[[byte]],
+    // 0 directives, 1 bytes of the name arena used, 2 bytes of the data arena used.
+    meta: Box[[int]],
+    // The four header fields of the directive being parsed.
+    head: Box[[int]],
+}
+
+// Read one decimal field (at most 255) starting at `at`: its value in the high half and the position after it in the
+// low half, or -1 when the text is not a decimal field or the value is over 255. The text is at most 64 KiB of
+// directives, but the positions the table here can reach stay far under 2^24 bytes apart, so a half each is safe.
+fn field[&s](text: &s [byte], at: int) -> [] int {
+    var v = 0;
+    var digits = 0;
+    var go = true;
+    while go && at + digits < len(text) {
+        let c = int_of(text[at + digits]);
+        if c < '0' || c > '9' || digits >= 3 {
+            go = false;
+        } else {
+            v = v * 10 + c - '0';
+            digits = digits + 1;
+            if v > 255 {
+                go = false;
+            }
+        }
+    }
+    if digits == 0 || v > 255 {
+        return 0 - 1;
+    }
+    return at + digits + v * 16777216;
+}
+
+// The value of the field `field` read.
+fn field_value(got: int) -> [] int {
+    return got / 16777216;
+}
+
+// The position after the field `field` read.
+fn field_end(got: int) -> [] int {
+    return got % 16777216;
+}
+
+// A slice of the byte arena `dest` receives `n` decimal fields from `text` at `at`; -1 on any malformation.
+fn bytes_from[&s, &d](text: &s [byte], at: int, dest: &!d [byte], base: int, n: int) -> [] int {
+    var k = 0;
+    var pos = at;
+    var ok = true;
+    while ok && k < n {
+        let got = field(text, pos);
+        if got < 0 {
+            ok = false;
+        } else {
+            dest[base + k] = byte_of(field_value(got));
+            pos = field_end(got);
+            if k + 1 < n {
+                if pos >= len(text) || int_of(text[pos]) != ' ' {
+                    ok = false;
+                } else {
+                    pos = pos + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if !ok {
+        return 0 - 1;
+    }
+    return pos;
+}
+
+// Parse the four header fields `kind rtype nlen dlen` of the directive at `at`; the position after them, or -1.
+fn header[&s, &h](text: &s [byte], at: int, head: &!h [int]) -> [] int {
+    var which = 0;
+    var pos = at;
+    while which < 4 {
+        let got = field(text, pos);
+        if got < 0 {
+            return 0 - 1;
+        }
+        head[which] = field_value(got);
+        pos = field_end(got) + 1;
+        which = which + 1;
+    }
+    return pos;
+}
+
+pub fn open[&h](heap: &!h Heap) -> [heap] Local {
+    var l = Local { rows: box_slice(heap, 6 * max_entries(), 0), names: box_slice(heap, max_entries() * name_room(), byte_of(0)), data: box_slice(heap, max_entries() * data_room(), byte_of(0)), meta: box_slice(heap, 3, 0), head: box_slice(heap, 4, 0) };
+    let text = localtab.text();
+    borrow mut l as &!w in {
+        let rows = contents(w.rows);
+        let names = contents(w.names);
+        let data = contents(w.data);
+        let meta = contents(w.meta);
+        let head = contents(w.head);
+        var at = 0;
+        var i = 0;
+        var ok = true;
+        while ok && i < localtab.count() && at < len(text) {
+            // `kind rtype nlen dlen`, then the name's bytes and the data's, one directive per line.
+            let after_head = header(text, at, head);
+            if after_head < 0 {
+                ok = false;
+            }
+            var after_name = 0 - 1;
+            var after_data = 0 - 1;
+            if ok {
+                let kind = head[0];
+                let nlen = head[2];
+                let dlen = head[3];
+                if kind < 0 || kind > 3 || nlen < 1 || nlen > name_room() || dlen < 0 || dlen > data_room() {
+                    ok = false;
+                } else if meta[1] + nlen > max_entries() * name_room() || meta[2] + dlen > max_entries() * data_room() {
+                    ok = false;
+                }
+            }
+            if ok {
+                after_name = bytes_from(text, after_head, names, meta[1], head[2]);
+                if after_name < 0 {
+                    ok = false;
+                }
+            }
+            if ok {
+                after_data = after_name;
+                if head[3] > 0 {
+                    if int_of(text[after_name]) != ' ' {
+                        ok = false;
+                    } else {
+                        after_data = bytes_from(text, after_name + 1, data, meta[2], head[3]);
+                        if after_data < 0 {
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            if ok {
+                let nlen = head[2];
+                let dlen = head[3];
+                rows[6 * i] = head[0];
+                rows[6 * i + 1] = head[1];
+                rows[6 * i + 2] = meta[1];
+                rows[6 * i + 3] = nlen;
+                rows[6 * i + 4] = meta[2];
+                rows[6 * i + 5] = dlen;
+                meta[1] = meta[1] + nlen;
+                meta[2] = meta[2] + dlen;
+                i = i + 1;
+                at = after_data;
+                // The line ends here; the generator wrote one directive per line.
+                if at < len(text) && int_of(text[at]) == '\n' {
+                    at = at + 1;
+                }
+            }
+        }
+        meta[0] = i;
+    }
+    return l;
+}
+
+pub fn close[&h](heap: &!h Heap, l: Local) -> [heap] int {
+    let Local { rows, names, data, meta, head } = l;
+    unbox_slice(heap, rows);
+    unbox_slice(heap, names);
+    unbox_slice(heap, data);
+    unbox_slice(heap, meta);
+    unbox_slice(heap, head);
+    return 0;
+}
+
+pub fn entries[&l](l: &l Local) -> [] int {
+    return contents(l.meta)[0];
+}
+
+// Does the expanded `name` (of `name_len` bytes, as `dns.name_expand` writes it) match directive `i`'s pattern at
+// `rtype`? A pattern's first label may be `*` (one byte), matching any one label; otherwise the names must be equal,
+// ignoring ASCII case. A directive of rtype 0 (a plain block) matches every type.
+pub fn matches[&l, &n](l: &l Local, i: int, name: &n [byte], name_len: int, rtype: int) -> [] bool {
+    let rows = contents(l.rows);
+    let rtype_of = rows[6 * i + 1];
+    if rtype_of != 0 && rtype_of != rtype {
+        return false;
+    }
+    let noff = rows[6 * i + 2];
+    let nlen = rows[6 * i + 3];
+    let names = contents(l.names);
+    var np = 0;
+    var qp = 0;
+    var wildcard = false;
+    if nlen >= 2 && int_of(names[noff]) == 1 && int_of(names[noff + 1]) == '*' {
+        wildcard = true;
+        np = 2;
+        // The pattern's star label matches any one label of the query name.
+        if qp >= name_len || int_of(name[qp]) == 0 {
+            return false;
+        }
+        qp = 1 + int_of(name[qp]);
+    }
+    while np < nlen - 1 {
+        if qp >= name_len {
+            return false;
+        }
+        let pl = int_of(names[noff + np]);
+        let ql = int_of(name[qp]);
+        if pl != ql {
+            return false;
+        }
+        var k = 0;
+        while k < pl {
+            if dns.fold(int_of(names[noff + np + 1 + k])) != dns.fold(int_of(name[qp + 1 + k])) {
+                return false;
+            }
+            k = k + 1;
+        }
+        np = np + 1 + pl;
+        qp = qp + 1 + ql;
+    }
+    // Both names end with a 0 byte.
+    return np == nlen - 1 && qp == name_len - 1 && int_of(name[qp]) == 0;
+}
+
+// The first directive that matches, or -1. The generator sorted longest-suffix first, exact before wildcard.
+pub fn find[&l, &n](l: &l Local, name: &n [byte], name_len: int, rtype: int) -> [] int {
+    var i = 0;
+    while i < entries(l) {
+        if matches(l, i, name, name_len, rtype) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The same, for a parsed query: the question name (`table[6]` is where it starts) expanded into `scratch`
+// (`dns.name_expand` writes a name as a length byte per label, then 0) and matched at `table[7]`. Answers the
+// directive, or -1.
+pub fn find_query[&l, &q, &t, &s](l: &l Local, query: &q [byte], table: &t [int], scratch: &!s [byte]) -> [] int {
+    let name_len = dns.name_expand(query, table[6], scratch);
+    if name_len < 0 {
+        return 0 - 1;
+    }
+    return find(l, scratch[0..name_len], name_len, table[7]);
+}
+
+pub fn kind_of[&l](l: &l Local, i: int) -> [] int {
+    return contents(l.rows)[6 * i];
+}
+
+// The SOA of `example.` the stub answers NXDOMAIN with, written out in full (`src/stub.cho`).
+fn put_soa[&o](out: &!o [byte], p: int) -> [] int {
+    var q = dns.put8(out, p, 7);
+    q = put_text(out, q, "example");
+    q = dns.put8(out, q, 0);
+    q = dns.put16(out, q, 6);
+    q = dns.put16(out, q, 1);
+    q = dns.put32(out, q, 30);
+    let start = q;
+    q = dns.put16(out, q, 0);
+    q = dns.put8(out, q, 2);
+    q = put_text(out, q, "ns");
+    q = dns.put8(out, q, 7);
+    q = put_text(out, q, "example");
+    q = dns.put8(out, q, 0);
+    q = dns.put8(out, q, 10);
+    q = put_text(out, q, "hostmaster");
+    q = dns.put8(out, q, 7);
+    q = put_text(out, q, "example");
+    q = dns.put8(out, q, 0);
+    q = dns.put32(out, q, 1);
+    q = dns.put32(out, q, 30);
+    q = dns.put32(out, q, 30);
+    q = dns.put32(out, q, 30);
+    q = dns.put32(out, q, 30);
+    dns.put16(out, start, q - start - 2);
+    return q;
+}
+
+fn put_text[&o, &s](out: &!o [byte], at: int, s: &s [byte]) -> [] int {
+    var p = at;
+    var i = 0;
+    while i < len(s) {
+        p = dns.put8(out, p, int_of(s[i]));
+        i = i + 1;
+    }
+    return p;
+}
+
+// Write the answer for the matched directive `i` into `out`, after the question copied from `query[0..question_end]`.
+// A record or override answers one record of TTL 30; a plain block answers NXDOMAIN with the SOA; a block with an
+// address answers one A record for an A query and NXDOMAIN for any other. `table` is the parsed query (`dns.parse`),
+// and an OPT is echoed as the stub does, with `limit` truncating as the stub does. Answers the length, or
+// `dns.error_no_room()`.
+pub fn respond[&o, &q, &t, &l](out: &!o [byte], query: &q [byte], table: &t [int], l: &l Local, i: int, question_end: int, limit: int) -> [] int {
+    let rows = contents(l.rows);
+    let kind = rows[6 * i];
+    let rtype = rows[6 * i + 1];
+    let doff = rows[6 * i + 4];
+    let dlen = rows[6 * i + 5];
+    var answers = 1;
+    var authority = 0;
+    var rcode = 0;
+    var atype = rtype;
+    if kind == block_a() {
+        // The block's address answers an A query; any other type is NXDOMAIN.
+        atype = 1;
+        if table[7] != 1 {
+            answers = 0;
+            authority = 1;
+            rcode = 3;
+        }
+    } else if kind == block_nx() {
+        answers = 0;
+        authority = 1;
+        rcode = 3;
+    }
+    var extra = 0;
+    if table[9] >= 0 {
+        extra = dns.opt_size();
+    }
+    let soa = 9 + 4 + 2 + 5 + 4 + 2 + 5 + 3 + 20;
+    var answer_bytes = 12 + dlen;
+    if answers == 0 {
+        answer_bytes = soa;
+    }
+    let total = question_end + answer_bytes + extra;
+    var truncated = false;
+    if limit > 0 && total > limit {
+        truncated = true;
+    }
+    var size = total;
+    if truncated {
+        size = question_end + extra;
+        answers = 0;
+        authority = 0;
+    }
+    if size > len(out) {
+        return dns.error_no_room();
+    }
+    var flags = 32768 + table[1] / 256 % 2 * 256 + 128 + rcode;
+    if truncated {
+        flags = flags + 512;
+    }
+    var p = dns.put16(out, 0, table[0]);
+    p = dns.put16(out, p, flags);
+    p = dns.put16(out, p, 1);
+    p = dns.put16(out, p, answers);
+    p = dns.put16(out, p, authority);
+    p = dns.put16(out, p, 0);
+    if table[9] >= 0 {
+        p = dns.put16(out, p, 1);
+    } else {
+        p = dns.put16(out, p, 0);
+    }
+    var k = dns.header_size();
+    while k < question_end {
+        out[k] = query[k];
+        k = k + 1;
+    }
+    p = question_end;
+    if answers == 1 {
+        p = dns.put16(out, p, 49164);
+        p = dns.put16(out, p, atype);
+        p = dns.put16(out, p, 1);
+        p = dns.put32(out, p, ttl());
+        p = dns.put16(out, p, dlen);
+        let data = contents(l.data);
+        var j = 0;
+        while j < dlen {
+            p = dns.put8(out, p, int_of(data[doff + j]));
+            j = j + 1;
+        }
+    }
+    if authority == 1 {
+        p = put_soa(out, p);
+    }
+    if table[9] >= 0 {
+        p = dns.put_opt(out, p, 1232, 0);
+    }
+    return p;
+}

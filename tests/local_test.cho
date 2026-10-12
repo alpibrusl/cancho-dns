@@ -1,0 +1,160 @@
+edition 5;
+
+import std.test;
+import dns;
+import local;
+import localtab;
+
+// The local table (`src/local.cho`) against the codec: what `open` reads from the generated table, which patterns
+// match which names, and what `respond` writes for each kind. `docs/design.md` section 17 (gate 15) is the list this
+// file answers. The table of `tests/localtab_test.cho`:
+//
+//     record www.example A 192.0.2.1
+//     override api.example CNAME www.example
+//     block ads.example
+//     block trk.example 192.0.2.254
+//     record *.corp A 192.0.2.3
+//     record example A 10.0.0.1
+
+// An expanded wire name `<first>.example` into `buf`; answers its length.
+// `<first>.example` as an expanded name at `at`; answers the position after it.
+fn name_at[&b, &f](buf: &!b [byte], at: int, first: &f [byte]) -> [] int {
+    var p = dns.put8(buf, at, len(first));
+    var i = 0;
+    while i < len(first) {
+        p = dns.put8(buf, p, int_of(first[i]));
+        i = i + 1;
+    }
+    p = dns.put8(buf, p, 7);
+    i = 0;
+    while i < 7 {
+        p = dns.put8(buf, p, int_of("example"[i]));
+        i = i + 1;
+    }
+    return dns.put8(buf, p, 0);
+}
+
+// The same, into a fresh buffer (the matching tests hand the name to `find` on its own).
+fn name_of[&b, &f](buf: &!b [byte], first: &f [byte]) -> [] int {
+    return name_at(buf, 0, first);
+}
+
+// A query for `<first>.example` of `qtype` into `buf`; answers its length.
+fn query_of[&b, &f](buf: &!b [byte], first: &f [byte], qtype: int) -> [] int {
+    var p = dns.put16(buf, 0, 4660);
+    p = dns.put16(buf, p, 256);
+    p = dns.put16(buf, p, 1);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = dns.put16(buf, p, 0);
+    p = name_at(buf, dns.header_size(), first);
+    p = dns.put16(buf, p, qtype);
+    return dns.put16(buf, p, 1);
+}
+
+fn test_open_reads_the_whole_table[&h](heap: &!h Heap) -> [heap] int {
+    var l = local.open(heap);
+    borrow mut l as &!w in {
+        test.assert_eq(local.entries(w), 6);
+    }
+    local.close(heap, l);
+    return 0;
+}
+
+fn test_matching_follows_the_name_and_the_type[&h](heap: &!h Heap) -> [heap] int {
+    var l = local.open(heap);
+    borrow mut l as &!w in {
+        region g {
+            let name = alloc_slice[g](256, byte_of(0));
+            // `www.example` of A is the fourth directive (longest suffix first); case does not matter.
+            let n = name_of(name, "WwW");
+            test.assert_eq(local.find(w, name[0..n], n, 1), 3);
+            // Another type does not match a typed directive.
+            test.assert_eq(local.find(w, name[0..n], n, 28), 0 - 1);
+            // `api.example` of CNAME is the override (the second directive); of A it is nothing.
+            let m = name_of(name, "api");
+            test.assert_eq(local.find(w, name[0..m], m, 5), 1);
+            test.assert_eq(local.find(w, name[0..m], m, 1), 0 - 1);
+            // A plain block (the first directive) matches every type.
+            let a = name_of(name, "ads");
+            test.assert_eq(local.find(w, name[0..a], a, 1), 0);
+            test.assert_eq(local.find(w, name[0..a], a, 16), 0);
+            // A block with an address matches only A.
+            let t = name_of(name, "trk");
+            test.assert_eq(local.find(w, name[0..t], t, 1), 2);
+            test.assert_eq(local.find(w, name[0..t], t, 28), 0 - 1);
+            // The wildcard matches any one label in its place; a two-label name does not fit.
+            let pat = alloc_slice[g](256, byte_of(0));
+            var p = dns.put8(pat, 0, 3);
+            p = dns.put8(pat, p, 'a');
+            p = dns.put8(pat, p, 'b');
+            p = dns.put8(pat, p, 'c');
+            p = dns.put8(pat, p, 4);
+            p = dns.put8(pat, p, 'c');
+            p = dns.put8(pat, p, 'o');
+            p = dns.put8(pat, p, 'r');
+            p = dns.put8(pat, p, 'p');
+            p = dns.put8(pat, p, 0);
+            test.assert_eq(local.find(w, pat[0..p], p, 1), 4);
+            var q = p - 6;
+            test.assert_eq(local.find(w, pat[0..q], q, 1), 0 - 1);
+            // A name the table does not know at all.
+            let x = name_of(name, "nope");
+            test.assert_eq(local.find(w, name[0..x], x, 1), 0 - 1);
+        }
+    }
+    local.close(heap, l);
+    return 0;
+}
+
+fn test_respond_writes_the_wire_bytes[&h](heap: &!h Heap) -> [heap] int {
+    var l = local.open(heap);
+    borrow mut l as &!w in {
+        region g {
+            let table = alloc_slice[g](dns.slots(), 0);
+            let data = alloc_slice[g](512, byte_of(0));
+            let out = alloc_slice[g](512, byte_of(0));
+            // A record: one A answer, TTL 30, and the right address.
+            var q = query_of(data, "www", 1);
+            test.assert_eq(dns.parse(data[0..q], table), q);
+            let scratch = alloc_slice[g](256, byte_of(0));
+            let found = local.find_query(w, data[0..q], table, scratch);
+            test.assert_eq(found, 3);
+            let qend = dns.header_size() + 17;
+            var n = local.respond(out[0..512], data[0..q], table, w, found, qend, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], table), n);
+            test.assert_eq(dns.u16_at(out[0..n], 6), 1);
+            test.assert_eq(dns.u32_at(out[0..n], qend + 6), 30);
+            test.assert_eq(dns.u16_at(out[0..n], qend + 10), 4);
+            test.assert_eq(int_of(out[qend + 12]), 192);
+            // A block: NXDOMAIN with one SOA in the authority section.
+            q = query_of(data, "ads", 1);
+            test.assert_eq(dns.parse(data[0..q], table), q);
+            let blocked = local.find_query(w, data[0..q], table, scratch);
+            test.assert_eq(blocked, 0);
+            let aend = dns.header_size() + 17;
+            n = local.respond(out[0..512], data[0..q], table, w, blocked, aend, 0);
+            test.assert(n > 0);
+            test.assert_eq(dns.parse(out[0..n], table), n);
+            test.assert_eq(dns.u16_at(out[0..n], 2) % 16, 3);
+            test.assert_eq(dns.u16_at(out[0..n], 8), 1);
+            // A block with an address answers A with one record.
+            q = query_of(data, "trk", 1);
+            test.assert_eq(dns.parse(data[0..q], table), q);
+            let b = local.find_query(w, data[0..q], table, scratch);
+            test.assert_eq(b, 2);
+            n = local.respond(out[0..512], data[0..q], table, w, b, aend, 0);
+            test.assert_eq(dns.u16_at(out[0..n], 6), 1);
+            // Truncation, as the stub does: a limit smaller than the answer leaves the question and the OPT.
+            q = query_of(data, "www", 1);
+            test.assert_eq(dns.parse(data[0..q], table), q);
+            var t = local.respond(out[0..512], data[0..q], table, w, 3, qend, 32);
+            test.assert(t > 0);
+            test.assert_eq(dns.u16_at(out[0..t], 6), 0);
+            test.assert_eq(dns.u16_at(out[0..t], 2) / 512 % 2, 1);
+        }
+    }
+    local.close(heap, l);
+    return 0;
+}

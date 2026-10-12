@@ -60,7 +60,7 @@ def main():
                 continue
             open(os.path.join(work, "src", "dns.cho"), "w").write(source.replace(old, new))
             built = subprocess.run(
-                [cancho, "build", "--std", "tests/driver.cho", "src/dns.cho", "-o", "driver"],
+                [cancho, "build", "--std"] + (["--backend", os.environ["CANCHO_BACKEND"]] if os.environ.get("CANCHO_BACKEND") else []) + ["tests/driver.cho", "src/dns.cho", "-o", "driver"],
                 cwd=work, capture_output=True, text=True, timeout=120,
             )
             if built.returncode != 0:
@@ -72,6 +72,14 @@ def main():
                     capture_output=True, text=True, timeout=120,
                 )
                 caught = ran.returncode != 0
+                if not caught and name == "17 pointer hops allowed":
+                    # The differential corpus no longer carries a 17-hop chain (a dnspython release
+                    # began refusing it and moved the case between the columns); the unit tests do.
+                    unit = subprocess.run(
+                        [cancho, "test"] + (["--backend", os.environ["CANCHO_BACKEND"]] if os.environ.get("CANCHO_BACKEND") else []) + [os.path.join(HERE, "dns_test.cho"), os.path.join(work, "src", "dns.cho"), "--std"],
+                        capture_output=True, text=True, timeout=240,
+                    )
+                    caught = unit.returncode != 0
             except subprocess.TimeoutExpired:
                 caught = True  # a hang is a failure the harness would report
             print(("caught:   " if caught else "MISSED:   ") + name, flush=True)

@@ -4,7 +4,7 @@ import os, shutil, socket, subprocess, sys, tempfile, threading, time
 import dns.flags, dns.message, dns.query, dns.rcode, dns.rdataclass, dns.rdatatype, dns.rrset
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/limit.cho"]
+SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/limit.cho", "src/local.cho", "src/localtab.cho"]
 
 
 def free_udp_port():
@@ -15,7 +15,7 @@ def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-def build(cancho, upstream_ports, out, mutate=None, access_conf=None):
+def build(cancho, upstream_ports, out, mutate=None, access_conf=None, local_tab=None):
     """Build the server in `out` with an upstream table of 127.0.0.1:<port> for each port given (and, with `access_conf`, an access list
     from those lines instead of the repository's). `mutate` is (file, old, new), applied
     to a scratch copy of src/ so that a mutant of the matching code can be built the same way."""
@@ -36,11 +36,20 @@ def build(cancho, upstream_ports, out, mutate=None, access_conf=None):
             subprocess.run([sys.executable, os.path.join(ROOT, "tests", "gen_access.py"), os.path.join(work, "access.conf"), os.path.join(work, "access.cho")], check=True)
             os.remove(os.path.join(work, "src", "access.cho"))
             srcs.append("access.cho")
+        if local_tab:
+            # The generated table replaces the repository's own src/localtab.cho.
+            srcs = [s for s in srcs if s != "src/localtab.cho"]
+            srcs.append(local_tab)
         if mutate:
             f = os.path.join(work, mutate[0]); text = open(f).read()
             assert mutate[1] in text, "mutant does not apply: %r" % (mutate,)
             open(f, "w").write(text.replace(mutate[1], mutate[2], 1))
-        r = subprocess.run([cancho, "build", "--std", *srcs, "-o", os.path.abspath(out)], cwd=work, capture_output=True, text=True)
+        # CI builds with the default (LLVM) backend; a machine without clang sets CANCHO_BACKEND (e.g. "cranelift").
+        backend = os.environ.get("CANCHO_BACKEND")
+        cmd = [cancho, "build", "--std"]
+        if backend:
+            cmd += ["--backend", backend]
+        r = subprocess.run(cmd + srcs + ["-o", os.path.abspath(out)], cwd=work, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("build failed: " + (r.stderr + r.stdout)[-600:])
     finally:
