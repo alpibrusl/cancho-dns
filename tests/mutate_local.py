@@ -8,7 +8,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 SRC = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho",
-       "src/forward.cho", "src/limit.cho", "src/local.cho", "src/access.cho", "src/upstreams.cho"]
+       "src/forward.cho", "src/limit.cho", "src/local.cho", "src/access.cho", "src/upstreams.cho",
+       "src/cli.cho", "src/rules.cho"]
 
 # (file, old, new, what the mutant gets wrong)
 MUTANTS = [

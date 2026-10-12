@@ -27,7 +27,7 @@ for path, old, new, why in MUTANTS:
         cmd = [cancho, "build", "--std"]
         if backend:
             cmd += ["--backend", backend]
-        b = subprocess.run(cmd + ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/upstreams.cho", "src/limit.cho", "src/access.cho", "src/local.cho", "src/localtab.cho", "-o", "server"],
+        b = subprocess.run(cmd + ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/upstreams.cho", "src/limit.cho", "src/access.cho", "src/local.cho", "src/localtab.cho", "src/cli.cho", "src/rules.cho", "-o", "server"],
                            cwd=d, capture_output=True, text=True)
         if b.returncode != 0:
             print("BUILD FAILED (mutant invalid):", why, b.stderr[-200:]); sys.exit(1)

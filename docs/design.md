@@ -527,6 +527,63 @@ Not done in D4, said so.
 * A local answer is only as good as the file; DNSSEC (stage 2) may change that.
 * One record per name and type: the tie rule forbids more, and a local CNAME is not chased (v1 answers the target as data).
 
+## 18. D6, agent-friendly operation: the toolbox contract applied to a resolver
+
+*Status: built (section 18.1).* Task [#10](https://github.com/alpibrusl/cancho-dns/issues/10): the resolver must be as easy for an agent or a script to operate, inspect and debug as cancho-tools' tools. The model is [cancho-tools](https://github.com/alpibrusl/cancho-tools): `contract/rules.cho` (one catalogue, read by the code that exits and by `introspect`), `contract/describe.cho` (`introspect` and `skill` from the same tables), `contract/fail.cho` (errors as `{code, rule, message, hint, repair, detail}`), `scripts/manifest.py` (the authority report embedded by the build, at a fixed point).
+
+**What does not carry over to a server.** Said first, because the issue asks:
+
+* **Exit codes are not the server's vocabulary.** A tool answers a caller and exits; a server answers many callers and keeps running. The stable tag is; the exit code is not. A resolver's *startup* refusals exit (they are one caller: the operator), and they use the toolbox codes; a *run-time* refusal is a DNS reply with an RCODE, a rule tag in the log line and a counter, as D1-D4 already do. `introspect` keeps the exit codes it can emit, for the operator's loop only.
+* **stdin/stdout streaming does not carry over.** The server's admin surface is the *command line before it listens* (`introspect`, `skill`, `check`, `explain`, `diff`) and the DNS protocol while it runs; there is no NDJSON stream, because a server's long-lived stdout is not a contract an agent can rely on. Metrics stay where they are (`stats.bind`, section 14), and logs stay on stderr, bounded, one line per event (task #12).
+* **A repair that re-runs the tool does not carry over.** `toolbox.fail` builds `retry` argvs because a tool's caller can run them. A server's repair is advice to the operator: "lower the rate", "add the network to access.conf and rebuild", "shrink the local file". The `repair` field is `{"kind":"none","reason":...}` or `{"kind":"choose","options":[...]}` naming *configuration changes*, never a command.
+* **A separate bounded admin listener is not in v1** (the issue's "safe operation" bullet): every listener widens the authority row and the attack surface. The admin surface is the command line: the same binary, before it binds, answers `check`, `explain` and `diff` and exits; the running server changes nothing an operator could not have checked before starting it. `/readyz` is answered on the DNS port as a TXT query (`ready.bind`), which says why not ready in its record data, and nothing else; it costs no new capability.
+
+**Self-description, from the same tables the code uses.**
+
+* `dns introspect` prints one JSON object: `tool` (`dns`), `version`, `compiler` (the pin), `summary`, the authority report (embedded by the build at a fixed point, as cancho-tools' `scripts/manifest.py` does: pass 1 derives it, the generated file holds it, pass 2 requires the same report), the limits in force (port, idle, TTL clamps, cache bytes and keys, rate and burst) with their defaults and ceilings, the upstreams and the access list compiled in, the counters `stats.bind` reports, every rule tag the *code* can emit with its exit code (startup) or RCODE and counter (run time) and its repairability, and the guarantees (see below).
+* `dns skill` prints the markdown, from the same data.
+* The rule tags come from one catalogue, a table in a new `src/rules.cho`, read by the code that refuses (startup validation names `rules.find`'s exit code) and by `introspect`'s rule list, so the two cannot disagree. Gate 18 checks the equality, by the extra-rules pattern of cancho-tools#28: every fixture that a refusal reaches is a tag in the catalogue, and every tag has a fixture.
+* JSON Schemas for the outputs are published (`schemas/dns.v1.json`), and a gate validates every output against them over a corpus.
+
+**Errors as data, at startup and at run time.** The startup path is rewritten: argument validation collects every error as `{code, rule, message, hint, repair, detail}` (file, line and key where a config file is at fault -- the *generated* tables are already refused at generation with file and line, which is the same contract one step earlier), offers the nearest valid key where one is close (as cancho-tools' `args.unknown-flag` repair does), and exits with the first error's code. At run time the refusals already carry tags (`dns-*` from the codec, `acl_refused`, `rrl_dropped`); D6 adds the log line (task #12 builds on this) and keeps the DNS reply the RCODE says.
+
+**Safe operation.**
+
+* `dns check` prints the resolved configuration and the authority report the running server would have, and changes nothing (no bind, no listen; the gate is trace-based as cancho-tools' dry-run gate: run under `strace` and assert no `socket`/`bind`/`listen` call).
+* `dns explain NAME TYPE` says, without sending anything: which local directive matches (its kind, file-line of the config it came from, and the answer it would give), else whether the cache would answer (it cannot say without state; it says so), else which upstream would be asked (the selection order), and what the reply's shape would be. `explain` names the *policy*: the TTL clamps, the 0x20 and port randomisation, the defences.
+* `dns diff OLD NEW` says what changed between two configuration files: upstreams added and removed, access-list prefixes added and removed, local directives added and removed. **Both must live under `conf/`** (a run-time path cannot narrow a capability, and a whole-filesystem `fs_read("")` is what refusing that costs: the file is read through `Fs("conf/")`, a literal, so the row gains exactly `fs_read("conf/")` and nothing else -- a visible change, made for the operator's loop, recorded here with the reason). The authority delta is what `introspect` prints, not what the compiler can prove (a new upstream does not move the `net_out("")` bound; section 2 said why).
+* Byte-stable outputs: the same binary and configuration print byte-identical answers (a gate runs each command twice and diffs).
+
+**Gates, fixed now.**
+
+18. *The rule list equals the rules the code can emit* (`tests/rules_test.py`): every tag in the catalogue is reached by a fixture, and every `rules.find` call site in the source names a tag in the catalogue (a grep-level gate, called weak as the upstream gate is).
+19. *Schemas* (`tests/schema_test.py`): `introspect`, `skill`'s front matter, `check`, `explain` and `diff` outputs validate against `schemas/dns.v1.json` over a corpus of configurations (valid, each refusal, two differing).
+20. *check/explain change no state* (`tests/safe_test.py`): under `strace`, `check` and `explain` make no `socket`, `bind`, `listen` or `write` call; the same query answered by the running server after `check` and `explain` ran behaves as if they had not.
+21. *Byte stability* (`tests/stable_test.py`): every command twice, diffed.
+22. *Authority*: the ceiling gains nothing: `introspect`'s embedded report is the compiler's own answer at a fixed point (a string constant adds no label), and the gate diffing the ceiling stays green.
+
+What this does not do: the MCP front (optional in the issue; a separate slice once the CLI contract is real), the admin listener, reload-without-restart, and `explain` of cache state (a cache is state, and `explain` is stateless by construction).
+
+### 18.1 Built and measured
+
+`src/rules.cho` (the catalogue: 22 tags, each with its exit code, RCODE, counter and repairability), `src/cli.cho` (`introspect`, `skill`, `check`, `explain`, `diff`, the error shape, the byte-stable printing), and the dispatch in `src/server.cho`: before anything is bound, `arg(1)` names a subcommand and the binary answers and exits.
+
+* `introspect` prints one JSON object: the version, the compiler pin, the summary, the limits with defaults and ceilings, the compiled-in upstreams, every rule with its exit code or RCODE and counter, and the guarantees. The authority report is a placeholder until the manifest script (cancho-tools' pattern, pass 1 derive / embed / pass 2 fixed point) is a slice of its own.
+* `check` prints the resolved configuration: the upstreams, the access list, the local directive count, the authority.
+* `explain NAME TYPE` opens the local table, matches, and names the directive's kind (record, override, block, block-address) and that the answer is never cached and never forwarded; says of the cache that it is state and `explain` stateless; names the first upstream and the policy (TTL clamps, 0x20, ports, truncation).
+* `diff OLD NEW` reads two files under `conf/` and prints each configuration's directives (a line absent from the other file is the change). **The authority row gains `fs_read("conf/")` and `io_write`**, both visible changes, recorded here: `narrow(fs, "/dev/urandom", "conf/")` answers both capabilities, a run-time path cannot narrow, and the operator's loop is what the gain buys.
+* *Gate 18* (`tests/agent_test.py`): `introspect` is one JSON object; every rule has a tag, a summary and a repairability; the run-time tags name the counters `stats.bind` reports.
+* *Gate 20*: `check`, `explain` and `introspect` exit at once (no `listening` on stderr), `explain` names the directive that would answer, `diff` reads only under `conf/`.
+* *Gate 21*: every command run twice, byte-identical.
+* *Gate 22*: the authority ceiling (`authority/server.ceiling`) gains exactly `fs_read("conf/")` and `io_write`, and the gate stays green.
+* **A bug the building found**: the first `diff` held two 64 KiB region slices at once and trapped reading the second file; one region at a time fixed it. And `json.put_fragment` traps on an empty string, so an authority report that is not embedded is printed as `null`, not crashed on.
+
+Not done in D6, said so.
+* The authority report in `introspect` is a placeholder; the manifest script (derive, embed, derive again at a fixed point) is a slice of its own, on the cancho-tools pattern.
+* The schema (`schemas/dns.v1.json`) is not published yet; the gates check the shape, not a schema file.
+* `diff` compares whole lines; a rename of a record is an add and a remove, which is honest but coarse.
+* The MCP front, the admin listener, `/readyz`, and errors as data on the startup path (the argument validation still exits with a bare code) are not in this slice.
+
 ## Reproduce (section 2)
 
 ```
