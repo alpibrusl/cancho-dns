@@ -66,91 +66,275 @@ pub fn header_size() -> [] int {
 }
 
 // What `parse` answers: the length of the message, or one of these. Each has a rule tag (`error_tag`) and the
-// RCODE a server answers a bad query with (`error_rcode`).
+// RCODE a server answers a bad query with (`error_rcode`). The vocabulary is the enum: a `match` over it is
+// checked exhaustive, so a code the caller forgets is a compile error, not a fall-through. The negative ints
+// (`-(1..11)`) it was are kept as the representation the callers and the tests hold, produced only by `code_of`.
+pub enum Refused {
+    ShortHeader,
+    BadCounts,
+    NameTooLong,
+    LabelTooLong,
+    BadPointer,
+    Truncated,
+    TooManyRecords,
+    BadEdns,
+    BadRdata,
+    TrailingBytes,
+    // Not a fault in a message: the buffer a message was to be written into is too small.
+    NoRoom,
+}
+
+// The code a refusal is carried as, in memory and in the tests: `-(1..11)` in the order `Refused` declares them.
+pub fn code_of(refusal: Refused) -> [] int {
+    match refusal {
+        Refused::ShortHeader => {
+            return 0 - 1;
+        }
+        Refused::BadCounts => {
+            return 0 - 2;
+        }
+        Refused::NameTooLong => {
+            return 0 - 3;
+        }
+        Refused::LabelTooLong => {
+            return 0 - 4;
+        }
+        Refused::BadPointer => {
+            return 0 - 5;
+        }
+        Refused::Truncated => {
+            return 0 - 6;
+        }
+        Refused::TooManyRecords => {
+            return 0 - 7;
+        }
+        Refused::BadEdns => {
+            return 0 - 8;
+        }
+        Refused::BadRdata => {
+            return 0 - 9;
+        }
+        Refused::TrailingBytes => {
+            return 0 - 10;
+        }
+        Refused::NoRoom => {
+            return 0 - 11;
+        }
+    }
+}
+
+// The refusal a code stands for, or `Refused::TrailingBytes` for a number that is none of them (a caller that
+// made one up).
+pub fn refused_of(code: int) -> [] Refused {
+    if code == 0 - 1 {
+        return Refused::ShortHeader;
+    }
+    if code == 0 - 2 {
+        return Refused::BadCounts;
+    }
+    if code == 0 - 3 {
+        return Refused::NameTooLong;
+    }
+    if code == 0 - 4 {
+        return Refused::LabelTooLong;
+    }
+    if code == 0 - 5 {
+        return Refused::BadPointer;
+    }
+    if code == 0 - 6 {
+        return Refused::Truncated;
+    }
+    if code == 0 - 7 {
+        return Refused::TooManyRecords;
+    }
+    if code == 0 - 8 {
+        return Refused::BadEdns;
+    }
+    if code == 0 - 9 {
+        return Refused::BadRdata;
+    }
+    if code == 0 - 10 {
+        return Refused::TrailingBytes;
+    }
+    return Refused::NoRoom;
+}
+
+// The codes the tests and the callers name, each a refusal.
 pub fn error_short_header() -> [] int {
-    return 0 - 1;
+    return code_of(Refused::ShortHeader);
 }
 
 pub fn error_bad_counts() -> [] int {
-    return 0 - 2;
+    return code_of(Refused::BadCounts);
 }
 
 pub fn error_name_too_long() -> [] int {
-    return 0 - 3;
+    return code_of(Refused::NameTooLong);
 }
 
 pub fn error_label_too_long() -> [] int {
-    return 0 - 4;
+    return code_of(Refused::LabelTooLong);
 }
 
 pub fn error_bad_pointer() -> [] int {
-    return 0 - 5;
+    return code_of(Refused::BadPointer);
 }
 
 pub fn error_truncated() -> [] int {
-    return 0 - 6;
+    return code_of(Refused::Truncated);
 }
 
 pub fn error_too_many_records() -> [] int {
-    return 0 - 7;
+    return code_of(Refused::TooManyRecords);
 }
 
 pub fn error_bad_edns() -> [] int {
-    return 0 - 8;
+    return code_of(Refused::BadEdns);
 }
 
 pub fn error_bad_rdata() -> [] int {
-    return 0 - 9;
+    return code_of(Refused::BadRdata);
 }
 
 pub fn error_trailing_bytes() -> [] int {
-    return 0 - 10;
+    return code_of(Refused::TrailingBytes);
 }
 
-// Not a fault in a message: the buffer a message was to be written into is too small.
 pub fn error_no_room() -> [] int {
-    return 0 - 11;
+    return code_of(Refused::NoRoom);
 }
 
-// Record types the parser looks inside, because their data holds names that must be walked to be trusted.
+// Record types the parser looks inside, because their data holds names that must be walked to be trusted. The
+// vocabulary is the enum, checked exhaustive at every `match`; the wire values stay what they are, produced only
+// by `wire_of`, and a type this module does not look inside is `Other`, carried as data like any other.
+pub enum RType {
+    A,
+    Ns,
+    Cname,
+    Soa,
+    Ptr,
+    Mx,
+    Aaaa,
+    Srv,
+    Dname,
+    Opt,
+    // Any type the parser does not look inside.
+    Other,
+}
+
+// The wire value of a type (`Other` answers 0: no record on the wire has it, and a caller that matches on a
+// parsed type reaches `Other` through `rtype_of` instead).
+pub fn wire_of(t: RType) -> [] int {
+    match t {
+        RType::A => {
+            return 1;
+        }
+        RType::Ns => {
+            return 2;
+        }
+        RType::Cname => {
+            return 5;
+        }
+        RType::Soa => {
+            return 6;
+        }
+        RType::Ptr => {
+            return 12;
+        }
+        RType::Mx => {
+            return 15;
+        }
+        RType::Aaaa => {
+            return 28;
+        }
+        RType::Srv => {
+            return 33;
+        }
+        RType::Dname => {
+            return 39;
+        }
+        RType::Opt => {
+            return 41;
+        }
+        RType::Other => {
+            return 0;
+        }
+    }
+}
+
+// The type a wire value stands for; anything else is `Other`.
+pub fn rtype_of(wire: int) -> [] RType {
+    if wire == 1 {
+        return RType::A;
+    }
+    if wire == 2 {
+        return RType::Ns;
+    }
+    if wire == 5 {
+        return RType::Cname;
+    }
+    if wire == 6 {
+        return RType::Soa;
+    }
+    if wire == 12 {
+        return RType::Ptr;
+    }
+    if wire == 15 {
+        return RType::Mx;
+    }
+    if wire == 28 {
+        return RType::Aaaa;
+    }
+    if wire == 33 {
+        return RType::Srv;
+    }
+    if wire == 39 {
+        return RType::Dname;
+    }
+    if wire == 41 {
+        return RType::Opt;
+    }
+    return RType::Other;
+}
+
 fn type_a() -> [] int {
-    return 1;
+    return wire_of(RType::A);
 }
 
 fn type_ns() -> [] int {
-    return 2;
+    return wire_of(RType::Ns);
 }
 
 fn type_cname() -> [] int {
-    return 5;
+    return wire_of(RType::Cname);
 }
 
 fn type_soa() -> [] int {
-    return 6;
+    return wire_of(RType::Soa);
 }
 
 fn type_ptr() -> [] int {
-    return 12;
+    return wire_of(RType::Ptr);
 }
 
 fn type_mx() -> [] int {
-    return 15;
+    return wire_of(RType::Mx);
 }
 
 fn type_aaaa() -> [] int {
-    return 28;
+    return wire_of(RType::Aaaa);
 }
 
 fn type_srv() -> [] int {
-    return 33;
+    return wire_of(RType::Srv);
 }
 
 fn type_dname() -> [] int {
-    return 39;
+    return wire_of(RType::Dname);
 }
 
 pub fn type_opt() -> [] int {
-    return 41;
+    return wire_of(RType::Opt);
 }
 
 pub fn u16_at[&d](data: &d [byte], at: int) -> [] int {
@@ -428,47 +612,59 @@ pub fn parse[&d, &t](data: &d [byte], table: &!t [int]) -> [] int {
 }
 
 // The rule tag of each error (`docs/design.md` section 5), as data: a log line and a `check` answer say these.
+// The rule tag of each refusal (`docs/design.md` section 5), as data: a log line and a `check` answer say
+// these. An exhaustive `match`: adding a refusal without naming its tag is a compile error.
 pub fn error_tag(code: int) -> [] &static [byte] {
-    if code == error_short_header() {
-        return "dns-bad-header";
+    match refused_of(code) {
+        Refused::ShortHeader => {
+            return "dns-bad-header";
+        }
+        Refused::BadCounts => {
+            return "dns-bad-counts";
+        }
+        Refused::NameTooLong => {
+            return "dns-name-too-long";
+        }
+        Refused::LabelTooLong => {
+            return "dns-label-too-long";
+        }
+        Refused::BadPointer => {
+            return "dns-bad-pointer";
+        }
+        Refused::Truncated => {
+            return "dns-truncated";
+        }
+        Refused::TooManyRecords => {
+            return "dns-too-many-records";
+        }
+        Refused::BadEdns => {
+            return "dns-bad-edns";
+        }
+        Refused::BadRdata => {
+            return "dns-bad-rdata";
+        }
+        Refused::TrailingBytes => {
+            return "dns-trailing-bytes";
+        }
+        Refused::NoRoom => {
+            return "dns-no-room";
+        }
     }
-    if code == error_bad_counts() {
-        return "dns-bad-counts";
-    }
-    if code == error_name_too_long() {
-        return "dns-name-too-long";
-    }
-    if code == error_label_too_long() {
-        return "dns-label-too-long";
-    }
-    if code == error_bad_pointer() {
-        return "dns-bad-pointer";
-    }
-    if code == error_truncated() {
-        return "dns-truncated";
-    }
-    if code == error_too_many_records() {
-        return "dns-too-many-records";
-    }
-    if code == error_bad_edns() {
-        return "dns-bad-edns";
-    }
-    if code == error_bad_rdata() {
-        return "dns-bad-rdata";
-    }
-    if code == error_no_room() {
-        return "dns-no-room";
-    }
-    return "dns-trailing-bytes";
 }
 
 // The RCODE a server answers a malformed query with: FORMERR (1) for all of them, and SERVFAIL (2) when it was
 // our own buffer that was too small.
+// The RCODE a server answers a bad query with: FORMERR for every fault in the message, SERVFAIL for a buffer
+// too small (our fault, not the querent's). An exhaustive `match`.
 pub fn error_rcode(code: int) -> [] int {
-    if code == error_no_room() {
-        return 2;
+    match refused_of(code) {
+        Refused::NoRoom => {
+            return 2;
+        }
+        _ => {
+            return 1;
+        }
     }
-    return 1;
 }
 
 // ---- Writing messages ------------------------------------------------------------------------------------------
