@@ -4,7 +4,7 @@ import os, shutil, socket, subprocess, sys, tempfile, threading, time
 import dns.flags, dns.message, dns.query, dns.rcode, dns.rdataclass, dns.rdatatype, dns.rrset
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho"]
+SOURCES = ["src/server.cho", "src/dns.cho", "src/stub.cho", "src/cache.cho", "src/store.cho", "src/rng.cho", "src/forward.cho", "src/limit.cho"]
 
 
 def free_udp_port():
@@ -15,22 +15,31 @@ def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-def build(cancho, upstream_ports, out, mutate=None):
-    """Build the server in `out` with an upstream table of 127.0.0.1:<port> for each port given. `mutate` is (file, old, new), applied
+def build(cancho, upstream_ports, out, mutate=None, access_conf=None):
+    """Build the server in `out` with an upstream table of 127.0.0.1:<port> for each port given (and, with `access_conf`, an access list
+    from those lines instead of the repository's). `mutate` is (file, old, new), applied
     to a scratch copy of src/ so that a mutant of the matching code can be built the same way."""
     work = tempfile.mkdtemp(prefix="dnsbuild-")
     try:
         shutil.copytree(os.path.join(ROOT, "src"), os.path.join(work, "src"))
-        if mutate:
-            f = os.path.join(work, mutate[0]); text = open(f).read()
-            assert mutate[1] in text, "mutant does not apply: %r" % (mutate,)
-            open(f, "w").write(text.replace(mutate[1], mutate[2], 1))
         conf = os.path.join(work, "upstreams.conf")
         with open(conf, "w") as f:
             f.write("".join("127.0.0.1 %d\n" % p for p in upstream_ports))
         gen = os.path.join(work, "upstreams.cho")
         subprocess.run([sys.executable, os.path.join(ROOT, "tests", "gen_upstreams.py"), conf, gen], check=True)
         srcs = [s for s in SOURCES] + ["upstreams.cho"]
+        if access_conf is None:
+            srcs.append("src/access.cho")
+        else:
+            with open(os.path.join(work, "access.conf"), "w") as f:
+                f.write(access_conf)
+            subprocess.run([sys.executable, os.path.join(ROOT, "tests", "gen_access.py"), os.path.join(work, "access.conf"), os.path.join(work, "access.cho")], check=True)
+            os.remove(os.path.join(work, "src", "access.cho"))
+            srcs.append("access.cho")
+        if mutate:
+            f = os.path.join(work, mutate[0]); text = open(f).read()
+            assert mutate[1] in text, "mutant does not apply: %r" % (mutate,)
+            open(f, "w").write(text.replace(mutate[1], mutate[2], 1))
         r = subprocess.run([cancho, "build", "--std", *srcs, "-o", os.path.abspath(out)], cwd=work, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("build failed: " + (r.stderr + r.stdout)[-600:])
@@ -39,9 +48,9 @@ def build(cancho, upstream_ports, out, mutate=None):
 
 
 class Server:
-    def __init__(self, binary, idle=10, min_ttl=1, memory=4 * 1048576, keys=4096):
+    def __init__(self, binary, idle=10, min_ttl=1, memory=4 * 1048576, keys=4096, rate=0, burst=1):
         self.port = free_port()
-        self.proc = subprocess.Popen([binary, str(self.port), str(idle), str(min_ttl), str(memory), str(keys)], stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen([binary, str(self.port), str(idle), str(min_ttl), str(memory), str(keys), str(rate), str(burst)], stderr=subprocess.PIPE)
         line = self.proc.stderr.readline()
         if not line.startswith(b"listening"):
             raise RuntimeError("server did not start: %r" % line)

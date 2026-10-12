@@ -556,6 +556,8 @@ pub fn stats_reply[&c, &q, &t, &o](cache: &c Cache, query: &q [byte], table: &t 
     p = put_stat(out, p, "drop_case", contents(cache.counts)[11]);
     p = put_stat(out, p, "drop_short", contents(cache.counts)[12]);
     p = put_stat(out, p, "drop_parse", contents(cache.counts)[13]);
+    p = put_stat(out, p, "acl_refused", contents(cache.counts)[14]);
+    p = put_stat(out, p, "rrl_dropped", contents(cache.counts)[15]);
     p = put_stat(out, p, "hits", hits(cache));
     p = put_stat(out, p, "misses", misses(cache));
     p = put_stat(out, p, "stored", stored(cache));

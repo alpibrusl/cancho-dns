@@ -1,0 +1,88 @@
+edition 5;
+
+module limit;
+
+// `limit` -- the response-rate limiter (`docs/design.md` section 16): a token bucket per client /24, in a table fixed at start.
+//
+// A bucket holds `burst` tokens at most and gains `rate` tokens a second; a response costs one. Tokens are kept in thousandths so that
+// the refill, `elapsed milliseconds * rate`, is exact in integers. A client's bucket is chosen by a keyed hash of its /24: the key is
+// drawn at start, so which networks share a bucket cannot be aimed at without it. Buckets are **shared on a collision, not reset**: a
+// deliberate collision can make a victim's network share an attacker's bucket, but cannot make the attacker's traffic escape the limit.
+
+pub fn buckets() -> [] int {
+    return 4096;
+}
+
+pub res struct Limiter {
+    // Per bucket: 0 thousandths of a token, 1 when it was last looked at (milliseconds).
+    cells: Box[[int]],
+    // 0 tokens a second (0: no limit), 1 the burst, 2 the hash key, 3 responses refused so far.
+    params: Box[[int]],
+}
+
+pub fn open[&h](heap: &!h Heap, rate: int, burst: int, key: int) -> [heap] Limiter {
+    var l = Limiter { cells: box_slice(heap, 2 * buckets(), 0), params: box_slice(heap, 4, 0) };
+    borrow mut l as &!w in {
+        let p = contents(w.params);
+        p[0] = rate;
+        p[1] = burst;
+        p[2] = key;
+        let cells = contents(w.cells);
+        var i = 0;
+        while i < buckets() {
+            cells[2 * i] = burst * 1000;
+            i = i + 1;
+        }
+    }
+    return l;
+}
+
+pub fn close[&h](heap: &!h Heap, l: Limiter) -> [heap] int {
+    let Limiter { cells, params } = l;
+    unbox_slice(heap, cells);
+    unbox_slice(heap, params);
+    return 0;
+}
+
+// How many responses have been refused.
+pub fn refused[&l](limiter: &l Limiter) -> [] int {
+    return contents(limiter.params)[3];
+}
+
+// The bucket for a client /24 (`network` is the address shifted down 8 bits).
+pub fn bucket_of(network: int, key: int) -> [] int {
+    // 31 bits times a 32-bit constant stays under 2^63, whatever the key and the network: this never traps.
+    let x = (network + key) % 2147483648;
+    let mixed = (x * 2654435761 + key) % 4294967296;
+    return mixed / 1048576 % buckets();
+}
+
+// May the client at `address` (the IPv4 address as a 32-bit number) be sent a response now? Takes the token if so.
+pub fn allow[&l](limiter: &!l Limiter, address: int, now: int) -> [] bool {
+    let p = contents(limiter.params);
+    if p[0] <= 0 {
+        return true;
+    }
+    let cells = contents(limiter.cells);
+    let b = 2 * bucket_of(address / 256, p[2]);
+    var elapsed = now - cells[b + 1];
+    // Beyond about 23 days a bucket is full whatever the rate; clamping keeps `elapsed * rate` far from overflow.
+    if elapsed > 2000000000 {
+        elapsed = 2000000000;
+    }
+    var tokens = cells[b];
+    if elapsed > 0 {
+        tokens = tokens + elapsed * p[0];
+        if tokens > p[1] * 1000 {
+            tokens = p[1] * 1000;
+        }
+        cells[b + 1] = now;
+    }
+    if tokens < 1000 {
+        cells[b] = tokens;
+        p[3] = p[3] + 1;
+        return false;
+    }
+    cells[b] = tokens - 1000;
+    return true;
+}

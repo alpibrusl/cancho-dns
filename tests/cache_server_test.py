@@ -15,7 +15,7 @@ def free_port():
 class Running:
     def __init__(self, min_ttl, memory, keys):
         self.port = free_port()
-        self.proc = subprocess.Popen([BIN, str(self.port), "10", str(min_ttl), str(memory), str(keys)], stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen([BIN, str(self.port), "10", str(min_ttl), str(memory), str(keys), "0", "1"], stderr=subprocess.PIPE)
         self.proc.stderr.readline()
 
     def stop(self):

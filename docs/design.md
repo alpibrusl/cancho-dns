@@ -1,6 +1,6 @@
 # cancho-dns: a forwarding and caching resolver in cancho
 
-Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), are built; the benchmark is not.** **Confirmed by the maintainer on
+Status: **design (task #1 of the epic, [#18](https://github.com/alpibrusl/cancho-dns/issues/18)); D0, the codec (section 12), D1, the UDP and TCP server (section 13), and D2, the cache (section 14), and D3, the forwarder (section 15), and D3b, the access list and rate limiter (section 16), are built; the benchmark is not.** **Confirmed by the maintainer on
 2026-10-07:** the v1 claim and the compiled-in upstream table (section 3), the proposed limits, policy values and benchmark criteria (sections 5, 6
 and 8, still labelled *proposed* below because they are values, not measurements; they are now fixed, and changing one is a change to this
 document, made in place with the reason), and filing the cancho prerequisite ([alpibrusl/cancho#362](https://github.com/alpibrusl/cancho/issues/362)).
@@ -436,6 +436,44 @@ Not done in D3, said so.
 * **The pending table is searched linearly** for a free slot and for timeouts (every 100 ms, 1,024 entries): its cost under load is unmeasured and is a likely first thing the benchmark of section 8.1 shows.
 * Nothing here is a benchmark. The per-datagram cost of the socket table (two builtin calls and two table accesses per call) is not measured.
 * An on-path attacker who can see the query can match every field; this is the protection against one who cannot.
+
+## 16. D3b, who may ask: the access list and the rate limiter, design and gates before the code
+
+*Status: built (section 16.1).* Section 15.1 ended with the resolver answering anyone who can reach it. Section 6 had a remedy on paper: a response-rate limiter per client /24 (4,096 buckets, 1,000 responses a second, burst 2,000) and a default that refuses clients outside configured prefixes. Both need the
+client's address, and the language did not give it: a bound socket answers through a ticket, and `Accepted` has no peer. Found by reading this section's mechanism against the language; `conns.peer` for a TCP connection is cancho#367 (already merged) and `udp_peer` for a datagram's sender is cancho#399, whose form it follows (the 19 bytes `conn_peer` writes, read by `std.addr`). The compiler pin is #399's merge commit, `93e49cd`. (A first version of this prerequisite, cancho#376, chose another encoding for `conn_peer` while #367 was landing; it was closed, not merged.)
+
+**Access list.** `access.conf` (`allow <ipv4>/<length>`, at most 16 lines) is compiled into `src/access.cho` by `tests/gen_access.py`, as the upstream table is. The repository's own file allows `127.0.0.0/8` and nothing else, so **the default is closed**: an operator opens it by listing the networks to serve.
+A UDP query from an address outside every prefix is answered `REFUSED` (small, the size of the query, so no amplification) and counted `acl_refused`; a TCP connection from one is closed at accept without a byte read, and counted the same. The check comes after the rate limiter, so a flood of refused queries is limited too.
+
+**Rate limiter.** Per client /24, a token bucket in 4,096 buckets chosen by a keyed hash (the key is drawn from the DRBG at start, so which networks share a bucket cannot be aimed at without it; **this is argued, not proven**). `rate` responses a second and a burst, both from the command line (defaults 1,000 and 2,000; a rate of 0 turns it off, and `explain` will say so).
+Buckets are shared on a collision, not reset: a deliberate collision can make a victim's network share an attacker's bucket, but cannot make the attacker's own traffic escape the limit. A UDP query over its bucket is dropped, not answered, and counted `rrl_dropped`. TCP is not limited by this: a TCP client has completed a handshake and so cannot be a spoofed source.
+
+**Gates, fixed now.**
+7. *Access* (`tests/access_test.py`, a server built with a table that allows `127.0.0.1/32` and `127.0.1.0/24`, clients bound to other loopback addresses): an allowed client is served over UDP and TCP; a client at `127.0.0.2` gets `REFUSED` over UDP and its TCP connection is closed unread; both counted; the same query from an allowed address afterwards is served (a refusal does not poison the cache or the limiter). Mutants: the check inverted; the check removed for UDP; removed for TCP; a prefix length ignored (`/32` taken as `/24`).
+8. *Rate* (`tests/rate_test.py`, rate 50 a second, burst 100): 2,000 queries sent as fast as possible from one address answer at most `burst + rate * seconds + 5` of them and at least `burst`; a second /24 asking at the same moment is answered in full; two hosts of one /24 share one bucket (together at most the same); after a pause of two seconds the bucket has refilled by about `2 * rate`; a rate of 0 answers all. Mutants: limiter off; bucket keyed by the full address rather than the /24; refill ignored; cost per response zero; burst ignored.
+9. *Limiter unit tests* (`tests/limit_test.cho`): the bucket arithmetic at its edges, with a fixed key and time.
+10. *Authority*: the ceiling does not change (`udp_peer` and `conn_peer` carry no label), and the diff in CI says so.
+11. *The README* says "closed by default" and what an open resolver is, and the limits above, nothing about abuse it was not measured against.
+
+What this does not do: stop a client inside an allowed prefix from sending many queries that each cost the upstream (the limiter is per /24 for responses, and a cache miss costs more than one); look at the content of the query; or defend against a spoofed source inside an allowed prefix (a datagram can name any source).
+
+### 16.1 Built and measured
+
+`src/limit.cho` (the token buckets), `src/access.cho` (generated by `tests/gen_access.py` from `access.conf`, which ships allowing `127.0.0.0/8` only), and the checks in `src/server.cho`. `server` takes two more arguments, `[<responses a second> [<burst>]]` (1,000 and 2,000; a rate of 0 is no limit).
+The compiler pin is the merge commit of cancho#399 (`udp_peer`), `93e49cd`.
+
+* *Limiter unit tests* (`tests/limit_test.cho`, 6): a burst then nothing until the bucket refills, to the millisecond; hosts of one /24 share a bucket and other networks do not; a rate of 0 limits nothing; buckets are spread over the table; the extremes of every input reach no trap.
+  **A bug the black-box test found in the first version:** the bucket hash multiplied a 32-bit value by a 32-bit constant, which overflows a 64-bit integer for about one key in five, so the server **trapped on its first query** for those keys (the key is drawn at start). It showed as a test that failed about one run in ten, not as a deterministic failure. Fixed by taking the sum modulo 2^31 before the multiply, with a test at the extremes, and `elapsed * rate` is clamped likewise. Since then 15 runs of the rate test in a row pass.
+* *Gate 7* (`tests/access_test.py`, 3 tests, a server built with `127.0.0.1/32` and `127.0.1.0/24`): the allowed addresses are served over UDP and TCP; `127.0.0.2`, `127.0.0.200` and `127.0.2.1` get `REFUSED` (no bigger than the query) and are counted; a refused address that sends garbage or a response gets nothing; a TCP connection from a refused address is closed without a byte read and counted; and the allowed client is served as before.
+* *Gate 8* (`tests/rate_test.py`, 3 tests, rate 50 and burst 100): 2,000 queries from one address were answered 117 times in 0.36 s (ceiling 158) and 1,883 were counted dropped; two of three other networks, asking at the same moment, were answered in full; two hosts of one /24 shared a bucket (the second got at most 25 of 60); after a two-second pause the bucket had refilled (at least 70 of 300); a rate of 0 answered at least 990 of 1,000.
+* *Mutants* (`tests/mutate_access.py`): **12 of 12 killed**: the UDP check inverted and removed, the TCP check inverted and removed, a prefix length ignored; the limiter off, buckets keyed by the full address, no refill, a response costing nothing, the bucket starting far over the burst (the unit test, because a first touch at any later time clamps the bucket and so hides it), the burst not a ceiling, and the server never asking the limiter.
+* *Gate 10*: the authority ceiling is unchanged, as predicted.
+
+Not done in D3b, said so.
+* The limiter works on responses sent to UDP clients, not on the work a cache miss causes an upstream, and a client inside an allowed prefix can still send as many cache-missing queries as its bucket permits; a datagram can name any source, so a spoofed source inside an allowed prefix spends that network's bucket.
+* The argument that a collision cannot be aimed at without the key is an argument; nothing here tests it.
+* IPv6, as everywhere.
+* The access list and the rate are start-up facts: a change is a rebuild or a restart, and `check`/`explain` (D4) do not exist yet to tell an operator what is in force.
 
 ## Reproduce (section 2)
 

@@ -1,0 +1,112 @@
+import std.test;
+import limit;
+import access;
+
+// The rate limiter's arithmetic (`src/limit.cho`) at its edges, with a fixed key and fixed times, and the access list's prefix test.
+
+fn test_a_burst_then_nothing_until_the_bucket_refills[&h](heap: &!h Heap) -> [heap] int {
+    var l = limit.open(heap, 10, 5, 0);
+    borrow mut l as &!w in {
+        // 10 tokens a second, a burst of 5: five answers at once, the sixth refused.
+        var i = 0;
+        while i < 5 {
+            test.assert(limit.allow(w, 16777343, 1000));
+            i = i + 1;
+        }
+        test.assert(!limit.allow(w, 16777343, 1000));
+        test.assert_eq(limit.refused(w), 1);
+        // 99 ms later 0.99 of a token: still refused; at 100 ms exactly one token: one answer, then refused again.
+        test.assert(!limit.allow(w, 16777343, 1099));
+        test.assert(limit.allow(w, 16777343, 1100));
+        test.assert(!limit.allow(w, 16777343, 1100));
+        // A long pause fills the bucket to the burst and no further: five answers, not fifty.
+        i = 0;
+        while i < 5 {
+            test.assert(limit.allow(w, 16777343, 600000));
+            i = i + 1;
+        }
+        test.assert(!limit.allow(w, 16777343, 600000));
+    }
+    limit.close(heap, l);
+    return 0;
+}
+
+fn test_hosts_of_one_slash_24_share_a_bucket_and_other_networks_do_not[&h](heap: &!h Heap) -> [heap] int {
+    var l = limit.open(heap, 1, 2, 7);
+    borrow mut l as &!w in {
+        // 127.0.0.1 and 127.0.0.200 are one /24; 127.0.1.1 is another.
+        test.assert(limit.allow(w, 2130706433, 0));
+        test.assert(limit.allow(w, 2130706633, 0));
+        test.assert(!limit.allow(w, 2130706433, 0));
+        test.assert(!limit.allow(w, 2130706633, 0));
+        test.assert(limit.allow(w, 2130706689, 0));
+        test.assert(limit.allow(w, 2130706689, 0));
+        test.assert(!limit.allow(w, 2130706689, 0));
+    }
+    limit.close(heap, l);
+    return 0;
+}
+
+fn test_a_rate_of_zero_limits_nothing[&h](heap: &!h Heap) -> [heap] int {
+    var l = limit.open(heap, 0, 1, 0);
+    borrow mut l as &!w in {
+        var i = 0;
+        while i < 1000 {
+            test.assert(limit.allow(w, 2130706433, 0));
+            i = i + 1;
+        }
+        test.assert_eq(limit.refused(w), 0);
+    }
+    limit.close(heap, l);
+    return 0;
+}
+
+fn test_every_bucket_index_is_in_range_and_networks_spread() -> [] int {
+    var seen = 0;
+    var n = 0;
+    region g {
+        let used = alloc_slice[g](limit.buckets(), 0);
+        while n < 20000 {
+            let b = limit.bucket_of(n * 7919, 123456789);
+            test.assert(b >= 0 && b < limit.buckets());
+            if used[b] == 0 {
+                used[b] = 1;
+                seen = seen + 1;
+            }
+            n = n + 1;
+        }
+    }
+    // 20,000 networks into 4,096 buckets: nearly all buckets are hit.
+    test.assert(seen > 4000);
+    return 0;
+}
+
+fn test_the_loopback_prefix_admits_loopback_and_nothing_else() -> [] int {
+    test.assert(access.allowed(2130706433));
+    test.assert(access.allowed(2147483647 - 1));
+    test.assert(!access.allowed(2147483648));
+    test.assert(!access.allowed(167772161));
+    test.assert(!access.allowed(0));
+    return 0;
+}
+
+fn test_no_key_network_or_time_reaches_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    // The extremes of every input: the largest key, network and rate, times from the beginning to far past a bucket's refill.
+    test.assert(limit.bucket_of(16777215, 4294967295) >= 0);
+    test.assert(limit.bucket_of(0, 4294967295) < limit.buckets());
+    test.assert(limit.bucket_of(16777215, 0) < limit.buckets());
+    var key = 3000000000;
+    while key < 4294967296 {
+        test.assert(limit.bucket_of(8355840, key) >= 0);
+        key = key + 40000001;
+    }
+    var l = limit.open(heap, 999999999, 999999, 4294967295);
+    borrow mut l as &!w in {
+        test.assert(limit.allow(w, 4294967295, 0));
+        test.assert(limit.allow(w, 4294967295, 9000000000000));
+        test.assert(limit.allow(w, 0, 1));
+        test.assert(limit.allow(w, 0, 0 - 5));
+    }
+    limit.close(heap, l);
+    return 0;
+}
