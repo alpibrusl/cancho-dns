@@ -2,452 +2,527 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/alpibrusl/cancho-dns/schemas/dns.v1.json",
   "title": "dns.v1",
-  "description": "The operator surface: one JSON object on one line per command, byte-stable. Every object names its command, the tool, the version and the compiler pin; ok is true on success. The error shape is the toolbox's (section 18 of docs/design.md).",
-  "type": "object",
-  "properties": {
-    "ok": {
-      "type": "boolean"
-    },
-    "command": {
-      "enum": [
-        "introspect",
-        "skill",
-        "check",
-        "explain",
-        "diff"
-      ]
-    },
-    "tool": {
-      "const": "dns"
-    },
-    "version": {
-      "type": "string"
-    },
-    "compiler": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{40}$"
-    }
-  },
-  "required": [
-    "ok",
-    "command",
-    "tool",
-    "version",
-    "compiler"
-  ],
-  "allOf": [
+  "description": "The operator surface: one JSON object on one line per command, byte-stable. Every object names its command, the tool, the version and the compiler pin; ok is true on success. The error shape is the toolbox's (section 18 of docs/design.md). A refusal prints the error document instead: ok false, every error kept, in input order.",
+  "oneOf": [
     {
-      "$comment": "introspect: the version, the summary, the limits, the embedded authority, the rule catalogue, the guarantees.",
-      "if": {
-        "properties": {
-          "command": {
-            "const": "introspect"
-          }
+      "$ref": "#/$defs/command_document"
+    },
+    {
+      "$ref": "#/$defs/error_document"
+    }
+  ],
+  "$defs": {
+    "command_document": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "command": {
+          "enum": [
+            "introspect",
+            "skill",
+            "check",
+            "explain",
+            "diff"
+          ]
+        },
+        "tool": {
+          "const": "dns"
+        },
+        "version": {
+          "type": "string"
+        },
+        "compiler": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
         }
       },
-      "then": {
-        "properties": {
-          "summary": {
-            "type": "string"
-          },
-          "authority": {
-            "$ref": "#/$defs/authority"
-          },
-          "limits": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "default": {
-                  "type": "string"
-                },
-                "ceiling": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "name",
-                "default",
-                "ceiling"
-              ],
-              "additionalProperties": false
+      "required": [
+        "ok",
+        "command",
+        "tool",
+        "version",
+        "compiler"
+      ],
+      "allOf": [
+        {
+          "$comment": "introspect: the version, the summary, the limits, the embedded authority, the rule catalogue, the guarantees.",
+          "if": {
+            "properties": {
+              "command": {
+                "const": "introspect"
+              }
             }
           },
-          "upstreams": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "host": {
-                  "type": "string"
-                },
-                "port": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 65535
-                }
+          "then": {
+            "properties": {
+              "summary": {
+                "type": "string"
               },
-              "required": [
-                "host",
-                "port"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "rules": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-              "type": "object",
-              "properties": {
-                "tag": {
-                  "type": "string",
-                  "pattern": "^[a-z0-9.-]+$"
-                },
-                "exit": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "rcode": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "counter": {
-                  "anyOf": [
-                    {
+              "authority": {
+                "$ref": "#/$defs/authority"
+              },
+              "limits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
                       "type": "string"
                     },
-                    {
-                      "type": "null"
+                    "default": {
+                      "type": "string"
+                    },
+                    "ceiling": {
+                      "type": "string"
                     }
-                  ]
-                },
-                "repairable": {
-                  "enum": [
-                    "always",
-                    "sometimes",
-                    "never"
-                  ]
-                },
-                "summary": {
+                  },
+                  "required": [
+                    "name",
+                    "default",
+                    "ceiling"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "upstreams": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "port"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "rules": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "tag": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9.-]+$"
+                    },
+                    "exit": {
+                      "anyOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rcode": {
+                      "anyOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "counter": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "repairable": {
+                      "enum": [
+                        "always",
+                        "sometimes",
+                        "never"
+                      ]
+                    },
+                    "summary": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tag",
+                    "exit",
+                    "rcode",
+                    "counter",
+                    "repairable",
+                    "summary"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "guarantees": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": {
                   "type": "string"
                 }
-              },
-              "required": [
-                "tag",
-                "exit",
-                "rcode",
-                "counter",
-                "repairable",
-                "summary"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "guarantees": {
-            "type": "object",
-            "minProperties": 1,
-            "additionalProperties": {
-              "type": "string"
-            }
+              }
+            },
+            "required": [
+              "summary",
+              "authority",
+              "limits",
+              "upstreams",
+              "rules",
+              "guarantees"
+            ]
           }
         },
-        "required": [
-          "summary",
-          "authority",
-          "limits",
-          "upstreams",
-          "rules",
-          "guarantees"
-        ]
-      }
-    },
-    {
-      "$comment": "check: the resolved configuration -- the compiled-in upstreams, the access list, the local directive count, the authority it would run with.",
-      "if": {
-        "properties": {
-          "command": {
-            "const": "check"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "upstreams": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "host": {
-                  "type": "string"
-                },
-                "port": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 65535
-                }
-              },
-              "required": [
-                "host",
-                "port"
-              ],
-              "additionalProperties": false
+        {
+          "$comment": "check: the resolved configuration -- the compiled-in upstreams, the access list, the local directive count, the authority it would run with.",
+          "if": {
+            "properties": {
+              "command": {
+                "const": "check"
+              }
             }
           },
-          "access": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "network": {
-                  "type": "integer"
-                },
-                "mask": {
-                  "type": "integer"
+          "then": {
+            "properties": {
+              "upstreams": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string"
+                    },
+                    "port": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "port"
+                  ],
+                  "additionalProperties": false
                 }
               },
-              "required": [
-                "network",
-                "mask"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "local-directives": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "authority": {
-            "$ref": "#/$defs/authority"
+              "access": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "network": {
+                      "type": "integer"
+                    },
+                    "mask": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "network",
+                    "mask"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "local-directives": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "authority": {
+                "$ref": "#/$defs/authority"
+              }
+            },
+            "required": [
+              "upstreams",
+              "access",
+              "local-directives",
+              "authority"
+            ]
           }
         },
-        "required": [
-          "upstreams",
-          "access",
-          "local-directives",
-          "authority"
-        ]
-      }
-    },
-    {
-      "$comment": "explain: what would happen to one query -- the local directive that would answer (or not), the cache said stateless, the forwarding path, the policy.",
-      "if": {
-        "properties": {
-          "command": {
-            "const": "explain"
+        {
+          "$comment": "explain: what would happen to one query -- the local directive that would answer (or not), the cache said stateless, the forwarding path, the policy.",
+          "if": {
+            "properties": {
+              "command": {
+                "const": "explain"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "local": {
+                "type": "object",
+                "oneOf": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "record",
+                          "override",
+                          "block",
+                          "block-address"
+                        ]
+                      },
+                      "not-cached": {
+                        "const": true
+                      },
+                      "not-forwarded": {
+                        "const": true
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "not-cached",
+                      "not-forwarded"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "properties": {
+                      "match": {
+                        "const": false
+                      }
+                    },
+                    "required": [
+                      "match"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "properties": {
+                      "match": {
+                        "const": false
+                      },
+                      "reason": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "match",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "cache": {
+                "type": "object",
+                "properties": {
+                  "answer": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "answer"
+                ],
+                "additionalProperties": false
+              },
+              "forward": {
+                "type": "object",
+                "oneOf": [
+                  {
+                    "properties": {
+                      "upstreams": {
+                        "const": 0
+                      },
+                      "answers-from": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "upstreams",
+                      "answers-from"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "properties": {
+                      "first-upstream": {
+                        "type": "string"
+                      },
+                      "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535
+                      }
+                    },
+                    "required": [
+                      "first-upstream",
+                      "port"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "policy": {
+                "type": "object",
+                "properties": {
+                  "ttl-clamp": {
+                    "type": "string"
+                  },
+                  "case": {
+                    "type": "string"
+                  },
+                  "ports": {
+                    "type": "string"
+                  },
+                  "truncation": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ttl-clamp",
+                  "case",
+                  "ports",
+                  "truncation"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "name",
+              "type",
+              "local",
+              "cache",
+              "forward",
+              "policy"
+            ]
+          }
+        },
+        {
+          "$comment": "diff: what changed between two configuration files, each directive listed, the counts, the note.",
+          "if": {
+            "properties": {
+              "command": {
+                "const": "diff"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "old": {
+                "type": "string"
+              },
+              "new": {
+                "type": "string"
+              },
+              "old-line": {
+                "type": "string"
+              },
+              "new-line": {
+                "type": "string"
+              },
+              "old-lines": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "new-lines": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "old",
+              "new",
+              "old-lines",
+              "new-lines",
+              "note"
+            ]
           }
         }
-      },
-      "then": {
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string"
-          },
-          "local": {
+      ]
+    },
+    "error_document": {
+      "$comment": "The error document: every startup error kept, in input order; the process exits with the first error's code.",
+      "type": "object",
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "errors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
             "type": "object",
-            "oneOf": [
-              {
+            "properties": {
+              "code": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9
+              },
+              "rule": {
+                "type": "string",
+                "pattern": "^(args|internal)\\.[a-z0-9-]+$"
+              },
+              "message": {
+                "type": "string"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "repair": {
+                "type": "object",
                 "properties": {
                   "kind": {
-                    "enum": [
-                      "record",
-                      "override",
-                      "block",
-                      "block-address"
-                    ]
-                  },
-                  "not-cached": {
-                    "const": true
-                  },
-                  "not-forwarded": {
-                    "const": true
-                  }
-                },
-                "required": [
-                  "kind",
-                  "not-cached",
-                  "not-forwarded"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "properties": {
-                  "match": {
-                    "const": false
-                  }
-                },
-                "required": [
-                  "match"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "properties": {
-                  "match": {
-                    "const": false
+                    "const": "none"
                   },
                   "reason": {
                     "type": "string"
                   }
                 },
                 "required": [
-                  "match",
+                  "kind",
                   "reason"
                 ],
                 "additionalProperties": false
-              }
-            ]
-          },
-          "cache": {
-            "type": "object",
-            "properties": {
-              "answer": {
-                "type": "string"
+              },
+              "detail": {
+                "type": "object"
               }
             },
             "required": [
-              "answer"
+              "code",
+              "rule",
+              "message",
+              "hint",
+              "repair",
+              "detail"
             ],
             "additionalProperties": false
-          },
-          "forward": {
-            "type": "object",
-            "oneOf": [
-              {
-                "properties": {
-                  "upstreams": {
-                    "const": 0
-                  },
-                  "answers-from": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "upstreams",
-                  "answers-from"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "properties": {
-                  "first-upstream": {
-                    "type": "string"
-                  },
-                  "port": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 65535
-                  }
-                },
-                "required": [
-                  "first-upstream",
-                  "port"
-                ],
-                "additionalProperties": false
-              }
-            ]
-          },
-          "policy": {
-            "type": "object",
-            "properties": {
-              "ttl-clamp": {
-                "type": "string"
-              },
-              "case": {
-                "type": "string"
-              },
-              "ports": {
-                "type": "string"
-              },
-              "truncation": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "ttl-clamp",
-              "case",
-              "ports",
-              "truncation"
-            ],
-            "additionalProperties": false
-          }
-        },
-        "required": [
-          "name",
-          "type",
-          "local",
-          "cache",
-          "forward",
-          "policy"
-        ]
-      }
-    },
-    {
-      "$comment": "diff: what changed between two configuration files, each directive listed, the counts, the note.",
-      "if": {
-        "properties": {
-          "command": {
-            "const": "diff"
           }
         }
       },
-      "then": {
-        "properties": {
-          "old": {
-            "type": "string"
-          },
-          "new": {
-            "type": "string"
-          },
-          "old-line": {
-            "type": "string"
-          },
-          "new-line": {
-            "type": "string"
-          },
-          "old-lines": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "new-lines": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "note": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "old",
-          "new",
-          "old-lines",
-          "new-lines",
-          "note"
-        ]
-      }
-    }
-  ],
-  "$defs": {
-    "$comment": "The authority report the build embedded: the compiler's own JSON, as `cancho authority --output json` derives it. Its outer shape is fixed here; the labels list is the ceiling's.",
+      "required": [
+        "ok",
+        "errors"
+      ],
+      "additionalProperties": false
+    },
     "authority": {
       "type": "object",
       "properties": {
