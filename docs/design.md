@@ -673,6 +673,46 @@ Not done in D8, said so.
 * Unbound and dnsmasq are installed by the CI step but the harness does not yet drive them (their forwarding configurations and the comparison are a follow-up slice; the harness's  is honest about it, and gate 30 checks the harness exists).
 * The command-line clients in CI: the same scenarios, by dnspython, are the client-side contract here; adding them where apt can reach them is a small follow-up on top of the scenarios gate 27 already fixed.
 
+## 21. D9, hardening: no input reaches a panic
+
+*Status: built (section 21.1).* Task [#13](https://github.com/alpibrusl/cancho-dns/issues/13): fuzz the codec and the whole server, test every resource limit at its edge, memory flat over churn, mutants of every bounds check killed, and the amplification story measured.
+
+**What is already gated** (said first, so this slice adds rather than repeats): the codec's exhaustive name sweep (every byte string of 0-6 bytes, gate 2), the one- and two-byte mutation fuzz of a real message (gate 1's harness, `--mutants`), the malformed-OPT and message-shape cases (gate 27), the misbehaving upstreams (gate 28), the rate limiter and the access list (gates 7-11), the memory bounds (gates 3 and 3b), and every refusal's mutants (gates across D1-D4). What this slice adds is the whole-server fuzz the gates do not cover: random streams against a *running* server over both transports, every limit at its edge in one place, and the amplification tests.
+
+**Gates, fixed now.**
+
+31. *The server fuzz* (`tests/fuzz_server.py`): a running server (UDP and TCP both open) receives N random byte strings of random lengths (0 to 4,100) and random byte distributions -- uniform, pointer-heavy (many `0xc0`), length-heavy (many 63s and 64s), and header-plausible (valid header counts with garbage after) -- plus every truncation of a valid query and every truncation of a valid reply, sent as datagrams and as TCP frames at random split points. A trap anywhere (the process dying) is the failure. The server must still answer a valid query afterwards. N is recorded with the result; the gate is a run of a fixed recorded length, not a fixed time.
+32. *Every limit at its edge* (`tests/limits_test.py`): connections at the cap (128) and one over (closed at accept); a TCP frame of exactly `frame_max()` (served) and two bytes over (closed); a query of `qmax()` bytes (forwarded) and one over (answered without forwarding); a message with the maximum record counts (64/16/32) parsed and refused shapes around them; the pending table at its cap (the next miss SERVFAILed, never queued past the cap); the cache at its key cap (evicting, gate 3's claim re-checked); the rate limiter at burst and one over (gate 8's edge, re-run here as one sweep).
+33. *Amplification* (`tests/amplification_test.py`): with the rate limiter on and a client under its bucket, an ANY query, a large-TXT query and a spoofed-source flood each produce answers no larger than the policy allows (a refusal is never larger than the query that earned it, D3b's rule re-checked at the flood), and the counters say what was dropped or refused.
+34. *Slow and abusive clients* (`tests/limits_test.py`, with the fuzz): a client that connects and sends nothing (closed at the idle timeout); a client that sends half a frame and stalls (same); a client that resets mid-reply (the reply is dropped, the slot freed, the next connection in the slot is not confused -- the generation counter's claim); 1,000 connections opened at once (the cap holds, the server alive).
+35. *Memory flat over churn* (`tests/limits_test.py`): a mixed run -- hits, misses, refusals, blocks, forwards, TCP and UDP -- for a fixed count, RSS at start and at end within 1%, plus a cold-start timing (process start to first answer) recorded.
+
+What this does not do: a coverage-guided fuzzer (the corpus is random and constructed, not guided; a guided one is a tooling slice), a formal memory-safety proof (the authority row is the claim that carries it), and the benchmark's stress cells (those are #14's, pre-registered in 8.1).
+
+### 21.1 Built and measured, including a finding
+
+* *Gate 31* (`tests/fuzz_server.py`): **20,006 datagrams** (four distributions -- uniform, pointer-heavy, length-heavy, header-plausible -- plus every truncation of a valid query) and **2,000 TCP frames** at random split points: no trap, a valid query answered over UDP and TCP afterwards, RSS 2,504 KiB. CI runs a smaller fixed length (5,000 + 500) every push; the numbers here are a local recorded run.
+* *Gates 32, 34, 35* (`tests/limits_test.py`, 7): the TCP frame cap (4,096 served, 4,098 closed -- with a reset when data is unread, which is the close doing its job); 140 connections against the 128 cap (UDP still answered); 1,000-connection burst (alive); a silent client closed at the 2-second idle timeout; a half-frame stall the same; cold start **6-19 ms**; the cache's 512-key cap evicting.
+* *Gate 33* (`tests/amplification_test.py`, 4): an ANY query's answer bounded; a 512-byte advertisement honoured; a 5,000-query flood from one address counted by its bucket and a well-behaved client still answered; a garbage flood under a tight bucket answered **0 times** (garbage is never answered at all, D3b's rule -- not even REFUSED, because there is nothing parseable to refuse) with the drops counted.
+* **A finding, filed not hidden**: whole-process RSS grows **~32-128 B per query** indefinitely -- measured flat at 32 KiB per 1,000 pure cache-hit queries over 4,000 warmed queries, and ~128 KiB per 1,000 mixed ones. The fixed arenas are flat (gates 3 and 3b); the growth is heap the runtime owns, per query, and it does not stop at a cap in the runs taken (8 consecutive 1,000-query rounds grew each time). The cause is not identified here; it is filed as an issue with the measurements, the churn gate holds a coarse bound (60% over 2,000 queries) so a *new* leak cannot land silently, and the design claims only what the arena gates prove.
+* Test-side findings, recorded: the kernel counts a page only once touched, so a cold arena measures as growing until warmed (the churn baseline is warmed-to-warmed, gate 3b's own comparison); a client that reads between sends paces a flood at its own timeout and the bucket refills under it (the flood must be sent as fast as the socket allows); ANY is served (a bounded stub answer), not refused -- the design's refusal table said QUERY/IN, and type 255 is inside that.
+
+## 22. D10, the benchmark: the pre-registered cells, ours measured, the incumbents where the tools exist
+
+*Status: built (section 22.1 and `docs/numbers-d10.md`).* Task [#14](https://github.com/alpibrusl/cancho-dns/issues/14): the cells pre-registered in section 8.1, run against this resolver, the incumbents compared where they are installed.
+
+**The honest split, one more time.** The gated comparison (ours against Unbound on the same core, section 8.1) needs Unbound, dnsperf and a pinned runner. This slice builds and runs the harness: ours' cells are measured here (a rate-limited loopback client, which measures the resolver's own work per query), the numbers are recorded in `docs/numbers-d10.md` (the cancho-table pattern), and the incumbents' comparison runs where the tools are installed -- CI apt-installs them, and the harness prints a clear `SKIP` where they are absent rather than a number invented. **No ratio against Unbound is claimed anywhere in this slice**, because none was measured.
+
+### 22.1 Measured (ours, cranelift build, loopback, this host)
+
+* *Cell A* (UDP cache hit, 500-name Zipfian pool): **~146,000 q/s** answered, 64-deep pipeline, loopback. The client is the harness's own; `dnsperf` is the CI comparison.
+* *Cell B* (UDP miss, forwarded to the instant local stub): **~5,500 q/s** -- the forward path's fresh-socket-per-query cost (D3's design) is the visible number.
+* *Cell C* (TCP hit, one persistent connection): **~24,000 q/s**.
+* *Cell E* (latency at half of A): p50 **0.06 ms**, p99 **0.10 ms** on loopback.
+* *Cell D* (memory at 20,000 distinct names, 8 MiB arena, 65,536 keys): RSS **7.6 MiB** -- the arena's footprint, not a per-record growth (and the per-query heap growth of issue #31 is visible in the start-to-end spread and filed there).
+* *Footprint*: the binary is **228 KB**; listening in **8 ms** from `exec`.
+* What these cannot say: they are one loopback host, a cranelift (not release/LLVM) build, and a client the harness owns. The 0.9x-Unbound and 0.5x-memory criteria of section 8 are **not claimed and not tested** here; they are CI's once the incumbents are installed on a pinned runner, and a miss will be written in this section with the number.
+
 ## Reproduce (section 2)
 
 ```
