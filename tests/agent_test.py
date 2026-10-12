@@ -32,6 +32,14 @@ class Introspect(unittest.TestCase):
         self.assertIsInstance(doc["rules"], list)
         self.assertIsInstance(doc["guarantees"], dict)
 
+    def test_the_authority_report_is_the_embedded_one(self):
+        """D12 (the manifest): the authority in introspect is the compiler's report, embedded at a fixed
+        point -- not null, bounded, and its labels are exactly the ceiling's."""
+        doc = json.loads(run("introspect").stdout)
+        self.assertIsNotNone(doc["authority"], "the build embeds the report")
+        self.assertTrue(doc["authority"]["bounded"])
+        self.assertGreater(len(doc["authority"]["labels"]), 5)
+
     def test_every_rule_has_a_tag_a_summary_and_a_repairability(self):
         doc = json.loads(run("introspect").stdout)
         self.assertGreater(len(doc["rules"]), 10)

@@ -7,6 +7,7 @@ import std.bytes;
 import std.io;
 import std.json;
 import rules;
+import built;
 import dns;
 import local;
 import localtab;
@@ -32,14 +33,16 @@ pub fn summary() -> [] &static [byte] {
     return "A forwarding and caching DNS resolver: one thread, one poller, a cache in a fixed arena, compiled-in upstreams, access list and local records, every refusal tagged.";
 }
 
-// What the build embeds (`scripts/manifest.py`): the compiler's authority report for this server at a fixed point,
-// and the compiler pin. Generated; do not edit by hand.
+// What the build embeds: the compiler's authority report for this server at a fixed point, and the compiler
+// pin, both held by `generated/built.cho` (`scripts/manifest.py`, cancho docs/agent-toolbox.md D12: pass 1
+// derives the report, the generated file embeds it, pass 2 derives again and requires the same report -- a
+// string constant adds no label, so the manifest describes the program that contains it).
 pub fn authority() -> [] &static [byte] {
-    return "";
+    return built.authority();
 }
 
 pub fn compiler() -> [] &static [byte] {
-    return "93e49cdab6e5ef6796cc423408e6d23ab40bc12f";
+    return built.compiler();
 }
 
 // The authority report the build embedded, or `null` when this binary was built without one (the manifest

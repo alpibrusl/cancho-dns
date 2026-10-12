@@ -35,6 +35,7 @@ for path, old, new, why, which in MUTANTS:
         work = tempfile.mkdtemp(prefix="mutant-unit-")
         try:
             shutil.copytree(os.path.join(os.path.dirname(here), "src"), os.path.join(work, "src"))
+            shutil.copytree(os.path.join(os.path.dirname(here), "generated"), os.path.join(work, "generated"))
             shutil.copytree(here, os.path.join(work, "tests"), ignore=shutil.ignore_patterns("__pycache__"))
             f = os.path.join(work, path); text = open(f).read()
             assert old in text, why
