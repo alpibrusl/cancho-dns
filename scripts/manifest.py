@@ -123,8 +123,13 @@ def ceiling():
 def gate(authority):
     problems = []
     allowed = set(ceiling())
-    if not authority.get("bounded", False):
-        problems.append("bounded is false")
+    # `bounded` is false while a network is held without a literal narrowing (the compiler's report since net-bounds): the
+    # ceiling names net_in("") and net_out(""), and what may make the report unbounded is exactly what it names.
+    for item in authority.get("unbounded_by", []):
+        if item not in allowed:
+            problems.append("unbounded by %s, which the ceiling does not allow" % item)
+    if not authority.get("bounded", True) and not authority.get("unbounded_by"):
+        problems.append("bounded is false and nothing says why")
     if authority.get("foreign_symbols"):
         problems.append("foreign symbols %s" % authority["foreign_symbols"])
     for label in authority["labels"]:

@@ -37,7 +37,8 @@ class Introspect(unittest.TestCase):
         point -- not null, bounded, and its labels are exactly the ceiling's."""
         doc = json.loads(run("introspect").stdout)
         self.assertIsNotNone(doc["authority"], "the build embeds the report")
-        self.assertTrue(doc["authority"]["bounded"])
+        # not bounded, by exactly the two networks the ceiling names (net_in("") and net_out("") are held un-narrowed)
+        self.assertEqual(sorted(doc["authority"]["unbounded_by"]), ['net_in("")', 'net_out("")'])
         self.assertGreater(len(doc["authority"]["labels"]), 5)
 
     def test_every_rule_has_a_tag_a_summary_and_a_repairability(self):
