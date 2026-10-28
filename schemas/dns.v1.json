@@ -460,6 +460,12 @@
             "type": "string"
           }
         },
+        "never_touches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "effects": {
           "type": "array",
           "items": {
