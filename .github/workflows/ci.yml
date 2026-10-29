@@ -19,50 +19,51 @@ jobs:
         with:
           path: dns
 
-      # The release for CANCHO_REV: a cancho built by cancho, one file, sha256 and reported commit checked
-      # (docs/standalone-cancho.md in alpibrusl/cancho). No Rust is needed.
+      # The release for CANCHO_REV: a cancho built by cancho, sha256 and reported commit checked; no Rust is needed
+      # (docs/standalone-cancho.md in alpibrusl/cancho). It is put where the scripts of this repository look for it.
       - name: Install cancho
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/alpibrusl/cancho/$CANCHO_REV/scripts/install.sh" | sh -s -- "$CANCHO_REV"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL "https://raw.githubusercontent.com/alpibrusl/cancho/$CANCHO_REV/scripts/install.sh" | sh -s -- "$CANCHO_REV" "$RUNNER_TEMP/cancho-release"
+          mkdir -p cancho/target/release
+          cp "$RUNNER_TEMP/cancho-release/bin/cancho" cancho/target/release/cancho
 
       - name: Formatting
         working-directory: dns
-        run: cancho fmt --check src tests
+        run: ../cancho/target/release/cancho fmt --check src tests
 
       - name: Codec tests (real messages, each refusal, every name of up to six bytes, every one- and two-byte change)
         working-directory: dns
-        run: cancho test tests/dns_test.cho src/dns.cho --std
+        run: ../cancho/target/release/cancho test tests/dns_test.cho src/dns.cho --std
 
       - name: Build the codec driver
         working-directory: dns
-        run: mkdir -p build && cancho build --std tests/driver.cho src/dns.cho -o build/driver
+        run: mkdir -p build && ../cancho/target/release/cancho build --std tests/driver.cho src/dns.cho -o build/driver
 
       - name: Stub responder tests
         working-directory: dns
-        run: cancho test tests/stub_test.cho src/dns.cho src/stub.cho --std
+        run: ../cancho/target/release/cancho test tests/stub_test.cho src/dns.cho src/stub.cho --std
 
       - name: Cache tests (TTLs, negative caching, answer chain, what is not cached, a flood of names)
         working-directory: dns
-        run: cancho test tests/cache_test.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho --std
+        run: ../cancho/target/release/cancho test tests/cache_test.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho --std
 
       - name: The cache tests can fail (each deliberately wrong cache is caught)
         working-directory: dns
-        run: python3 tests/mutate_cache.py cancho
+        run: python3 tests/mutate_cache.py ../cancho/target/release/cancho
 
       - name: Generator and matching tests (the DRBG, the matching rule, the 0x20 randomiser)
         working-directory: dns
         run: |
-          cancho test tests/rng_test.cho src/rng.cho --std
-          cancho test tests/forward_test.cho src/dns.cho src/rng.cho src/forward.cho --std
+          ../cancho/target/release/cancho test tests/rng_test.cho src/rng.cho --std
+          ../cancho/target/release/cancho test tests/forward_test.cho src/dns.cho src/rng.cho src/forward.cho --std
 
       - name: Limiter and access-list tests
         working-directory: dns
-        run: cancho test tests/limit_test.cho src/limit.cho src/access.cho --std
+        run: ../cancho/target/release/cancho test tests/limit_test.cho src/limit.cho src/access.cho --std
 
       - name: Local-table tests (records, overrides, blocks, wildcards, the wire bytes)
         working-directory: dns
-        run: cancho test tests/local_test.cho src/local.cho tests/localtab_test.cho src/dns.cho --std
+        run: ../cancho/target/release/cancho test tests/local_test.cho src/local.cho tests/localtab_test.cho src/dns.cho --std
 
       - name: The local table is what local.conf says (the generator is deterministic)
         working-directory: dns
@@ -76,11 +77,11 @@ jobs:
           python3 scripts/manifest.py
           python3 scripts/manifest.py --check
         env:
-          CANCHO: cancho
+          CANCHO: ../cancho/target/release/cancho
 
       - name: Build the server
         working-directory: dns
-        run: cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho -o build/server
+        run: ../cancho/target/release/cancho build --std src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho -o build/server
 
       - name: dnspython, the oracle of the differential test
         run: pip install dnspython
@@ -91,17 +92,17 @@ jobs:
 
       - name: The differential harness can fail (it catches each deliberately wrong codec)
         working-directory: dns
-        run: python3 tests/mutate_harness.py cancho python3
+        run: python3 tests/mutate_harness.py ../cancho/target/release/cancho python3
 
       - name: Authority is within the ceiling (gate 6)
         working-directory: dns
-        run: python3 tests/authority_check.py cancho authority/codec.ceiling tests/driver.cho src/dns.cho
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/codec.ceiling tests/driver.cho src/dns.cho
 
       - name: The authority gate can fail (a ceiling that is too small must be refused)
         working-directory: dns
         run: |
           printf 'io_write\n' > /tmp/too-small.ceiling
-          python3 tests/authority_check.py cancho /tmp/too-small.ceiling tests/driver.cho src/dns.cho --expect-failure
+          python3 tests/authority_check.py ../cancho/target/release/cancho /tmp/too-small.ceiling tests/driver.cho src/dns.cho --expect-failure
 
       - name: Server black-box tests (UDP, TCP, truncation, framing, limits)
         working-directory: dns
@@ -109,11 +110,11 @@ jobs:
 
       - name: The server tests can fail (each deliberately wrong server is caught)
         working-directory: dns
-        run: python3 tests/mutate_server.py cancho python3
+        run: python3 tests/mutate_server.py ../cancho/target/release/cancho python3
 
       - name: Server authority is within the ceiling (gate 6)
         working-directory: dns
-        run: python3 tests/authority_check.py cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho
+        run: python3 tests/authority_check.py ../cancho/target/release/cancho authority/server.ceiling src/server.cho src/dns.cho src/stub.cho src/cache.cho src/store.cho src/rng.cho src/forward.cho src/upstreams.cho src/limit.cho src/access.cho src/local.cho src/localtab.cho src/cli.cho src/rules.cho src/log.cho generated/built.cho
 
       - name: Cache black-box tests (hits, TTLs, negative answers, 100,000 names inside a 1 MiB store)
         working-directory: dns
@@ -121,49 +122,49 @@ jobs:
 
       - name: Forwarding black-box tests (retries, health, in-flight queries, TCP order, SERVFAIL)
         working-directory: dns
-        run: python3 tests/forward_server_test.py cancho
+        run: python3 tests/forward_server_test.py ../cancho/target/release/cancho
 
       - name: Spoofing harness (gate 4)
         working-directory: dns
-        run: python3 tests/spoof_test.py cancho
+        run: python3 tests/spoof_test.py ../cancho/target/release/cancho
 
       - name: The spoofing harness can fail (each deliberately wrong matcher is caught)
         working-directory: dns
-        run: python3 tests/mutate_spoof.py cancho
+        run: python3 tests/mutate_spoof.py ../cancho/target/release/cancho
 
       - name: Source-port entropy (gate 5, reported)
         working-directory: dns
-        run: python3 tests/ports_test.py cancho
+        run: python3 tests/ports_test.py ../cancho/target/release/cancho
 
       - name: Memory while every query is forwarded (gate 3b)
         working-directory: dns
-        run: python3 tests/forward_memory_test.py cancho
+        run: python3 tests/forward_memory_test.py ../cancho/target/release/cancho
 
       - name: Access list (gate 7)
         working-directory: dns
-        run: python3 tests/access_test.py cancho
+        run: python3 tests/access_test.py ../cancho/target/release/cancho
 
       - name: Rate limiter (gate 8)
         working-directory: dns
-        run: python3 tests/rate_test.py cancho
+        run: python3 tests/rate_test.py ../cancho/target/release/cancho
 
       - name: The access and rate tests can fail (each deliberately wrong server is caught)
         working-directory: dns
-        run: python3 tests/mutate_access.py cancho
+        run: python3 tests/mutate_access.py ../cancho/target/release/cancho
 
       - name: Local records, overrides and blocklists (gates 12 and 14)
         working-directory: dns
         run: |
           python3 tests/bounds_local.py
-          python3 tests/local_test.py cancho
+          python3 tests/local_test.py ../cancho/target/release/cancho
 
       - name: Differential matching against a plain reference (gate 13)
         working-directory: dns
-        run: python3 tests/differential_local.py cancho
+        run: python3 tests/differential_local.py ../cancho/target/release/cancho
 
       - name: The local tests can fail (each deliberately wrong server is caught)
         working-directory: dns
-        run: python3 tests/mutate_local.py cancho python3
+        run: python3 tests/mutate_local.py ../cancho/target/release/cancho python3
 
       - name: "The operator surface (gates 18, 20 and 21: introspect, check, explain, diff, byte-stable)"
         working-directory: dns
@@ -177,7 +178,7 @@ jobs:
 
       - name: "Query log and histogram (gates 23 to 25: the bound, the counts, what the line says)"
         working-directory: dns
-        run: python3 tests/log_test.py cancho
+        run: python3 tests/log_test.py ../cancho/target/release/cancho
 
       - name: "EDNS compliance from the client side (gate 27)"
         working-directory: dns
@@ -185,17 +186,17 @@ jobs:
 
       - name: "Misbehaving upstreams (gate 28)"
         working-directory: dns
-        run: python3 tests/misbehaving_test.py cancho
+        run: python3 tests/misbehaving_test.py ../cancho/target/release/cancho
 
       - name: "The differential against the incumbents (gate 29)"
         working-directory: dns
         run: |
           sudo apt-get install -y unbound dnsmasq >/dev/null 2>&1 || true
-          python3 tests/differential_resolver.py cancho
+          python3 tests/differential_resolver.py ../cancho/target/release/cancho
 
       - name: "The RFC coverage table is not stale (gate 30)"
         working-directory: dns
-        run: python3 tests/conformance_test.py cancho
+        run: python3 tests/conformance_test.py ../cancho/target/release/cancho
 
       - name: "The whole-server fuzz (gate 31)"
         working-directory: dns
@@ -213,4 +214,4 @@ jobs:
         working-directory: dns
         run: |
           (sudo apt-get install -y dnsperf unbound dnsmasq >/dev/null 2>&1 || true)
-          python3 tests/benchmark_resolver.py cancho --quick
+          python3 tests/benchmark_resolver.py ../cancho/target/release/cancho --quick
