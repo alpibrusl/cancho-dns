@@ -1,6 +1,9 @@
 {
-  "bounded": true,
-  "unbounded_by": [],
+  "bounded": false,
+  "unbounded_by": [
+    "net_in(\"\")",
+    "net_out(\"\")"
+  ],
   "effects": [
     "args",
     "clock",
@@ -71,12 +74,12 @@
     {
       "name": "net_in",
       "argument": "",
-      "bounded": true
+      "bounded": false
     },
     {
       "name": "net_out",
       "argument": "",
-      "bounded": true
+      "bounded": false
     },
     {
       "name": "poll",
@@ -93,6 +96,11 @@
       "argument": null,
       "bounded": true
     }
+  ],
+  "never_touches": [
+    "signals",
+    "other programs",
+    "foreign code"
   ],
   "foreign_symbols": [],
   "pure": [
@@ -113,6 +121,7 @@
     "capacity",
     "catalogue",
     "clamp",
+    "code_of",
     "compiler",
     "compiler",
     "count",
@@ -314,9 +323,8 @@
     "value",
     "version",
     "width_of",
+    "wire_of",
     "word"
   ],
-  "folded_operators": 124,
-  "folded_calls": 1,
-  "functions": 392
+  "functions": 394
 }

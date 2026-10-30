@@ -40,8 +40,14 @@ def main():
             problems.append("performs %s, which the ceiling does not allow" % label)
         for label in sorted(ceiling - performed):
             problems.append("the ceiling allows %s, which nothing performs (a ceiling only comes down)" % label)
-        if not report["bounded"]:
-            problems.append("the report is not bounded: " + ", ".join(report["unbounded_by"]))
+        # `bounded` is false while a network is held without a literal narrowing (the compiler's report since net-bounds):
+        # the server listens and forwards where it is configured, so net_in("") and net_out("") are in the ceiling. What may
+        # make the report unbounded is exactly what the ceiling names.
+        for item in report["unbounded_by"]:
+            if item not in ceiling:
+                problems.append("the report is unbounded by %s, which the ceiling does not allow" % item)
+        if not report["bounded"] and not report["unbounded_by"]:
+            problems.append("the report is not bounded and nothing says why")
         if report["foreign_symbols"]:
             problems.append("foreign symbols are reachable: " + ", ".join(report["foreign_symbols"]))
     for p in problems:
